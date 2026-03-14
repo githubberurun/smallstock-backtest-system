@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 # ==========================================
 
 def debug_log(msg: str) -> None:
-    """内部デバッグ用のロギング関数"""
+    """内部デバッグ用のロギング関数。引数の型チェックを含む。"""
     if not isinstance(msg, str): 
         msg = str(msg)
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -29,43 +29,45 @@ class JQuantsV2Client:
         if not isinstance(api_key, str): raise TypeError("api_key must be string")
         if not api_key: raise ValueError("API Key is required")
         self.api_key: str = api_key
-        # 2025年12月以降のV2エンドポイント
         self.base_url: str = "https://api.jquants.com/v2" 
 
     def get_statements(self, ticker: str) -> Dict[str, Any]:
-        """最新の財務諸表（短信サマリー）を取得する"""
+        """最新の財務諸表を取得する（エンドポイントの揺らぎに対応）"""
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
-        # V2仕様: x-api-keyヘッダにAPIキーを直接指定（トークン発行は廃止）
         headers = {"x-api-key": self.api_key}
-        url = f"{self.base_url}/fins/summary?code={ticker}"
         
-        try:
-            res = requests.get(url, headers=headers, timeout=15)
-            res.raise_for_status()
-            
-            resp_json = res.json()
-            data = []
-            
-            # V2仕様: "data" や "info" 等のリスト型キーを動的に探索して取得する堅牢な実装
-            for val in resp_json.values():
-                if isinstance(val, list):
-                    data = val
-                    break
-            
-            if not data:
-                return {}
-            
-            # 複数ある場合は DisclosedDate でソートして最新（配列の最後）を取得
-            data.sort(key=lambda x: str(x.get("DisclosedDate", "")))
-            return data[-1]
-            
-        except Exception as e:
-            debug_log(f"J-Quants API Error for {ticker}: {e}")
-            return {}
+        # V2仕様のエンドポイント（揺らぎを考慮して2パターン試行）
+        endpoints = [
+            f"{self.base_url}/fins/statements?code={ticker}",
+            f"{self.base_url}/fins/summary?code={ticker}"
+        ]
+        
+        for url in endpoints:
+            try:
+                res = requests.get(url, headers=headers, timeout=10)
+                if res.status_code == 404:
+                    continue # 次のエンドポイントを試す
+                res.raise_for_status()
+                
+                resp_json = res.json()
+                # 取得できた配列を探す (statements or data)
+                data = resp_json.get("statements") or resp_json.get("data") or []
+                
+                if not data:
+                    return {}
+                
+                # 複数ある場合は DisclosedDate でソートして最新を取得
+                data.sort(key=lambda x: str(x.get("DisclosedDate", "")))
+                return data[-1]
+                
+            except Exception as e:
+                debug_log(f"J-Quants URL({url}) Error: {e}")
+                
+        return {}
 
 # ==========================================
-# ファンダメンタルズ・キャッシュマネージャー（完全浄化＆フォールバック版）
+# 2. ファンダメンタルズ・キャッシュマネージャー（完全浄化・自動修復版）
 # ==========================================
 class FundamentalCache:
     """J-Quantsからの情報取得負荷を下げるためのローカルキャッシュ"""
@@ -76,6 +78,7 @@ class FundamentalCache:
         self.filepath = os.path.join(data_dir, "fundamentals_cache.json")
         self.jq_client = JQuantsV2Client(api_key)
         self.data: Dict[str, Dict[str, float]] = self._load()
+        self._validate_and_repair_cache()
 
     def _load(self) -> Dict[str, Dict[str, float]]:
         if os.path.exists(self.filepath):
@@ -86,41 +89,60 @@ class FundamentalCache:
                 debug_log(f"Failed to load fundamental cache: {e}")
         return {}
 
+    def _validate_and_repair_cache(self) -> None:
+        """キャッシュ内の異常値（小数保存による全滅等）を検知し強制浄化する"""
+        if not self.data: return
+        valid_count = 0
+        for d in self.data.values():
+            try:
+                if float(d.get('roe', 0.0)) >= 10.0 and float(d.get('equity_ratio', 0.0)) >= 50.0:
+                    valid_count += 1
+            except:
+                pass
+                
+        # 50銘柄以上あるのに1件も条件をクリアしない場合は、形式不整合（例: 15.0ではなく0.15になっている）と判断
+        if valid_count == 0 and len(self.data) > 50:
+            debug_log("WARNING: Local cache has 0 valid companies. Format may be corrupted (e.g., decimals). Forcing cache clear...")
+            self.data = {}
+            if os.path.exists(self.filepath):
+                try:
+                    os.remove(self.filepath)
+                except:
+                    pass
+
     def get_fundamentals(self, ticker: str) -> Dict[str, float]:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
-        roe_val = self.data.get(ticker, {}).get('roe', 0.0)
-        eq_val = self.data.get(ticker, {}).get('equity_ratio', 0.0)
-        
-        # 【完全浄化ロジック】過去の異常値 (-999.0, 0.0) がキャッシュにあれば強制再取得
-        needs_fetch = False
+        # 浄化処理を経てもなおキャッシュに存在しない場合はフェッチ
         if ticker not in self.data:
-            needs_fetch = True
-        elif roe_val in [0.0, -999.0] and eq_val in [0.0, -999.0]:
-            needs_fetch = True
-        elif roe_val == -999.0 or eq_val == -999.0:
-            needs_fetch = True
+            debug_log(f"Fetching fundamentals for {ticker}...")
+            roe, equity_ratio = 0.0, 0.0
             
-        if needs_fetch:
-            debug_log(f"Fetching fundamentals for {ticker} from J-Quants V2...")
             try:
                 stmt = self.jq_client.get_statements(ticker)
+                if not stmt:
+                    raise ValueError("No data returned from J-Quants")
                 
-                # キーの変動に備えた堅牢なパース
-                equity_raw = stmt.get("Equity") or stmt.get("equity") or stmt.get("NetAssets")
-                assets_raw = stmt.get("TotalAssets") or stmt.get("total_assets")
-                income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("profit") or stmt.get("OperatingProfit")
+                # J-Quants V2 短縮名等の推測
+                assets_raw = stmt.get("TotalAssets") or stmt.get("TotAssets") or stmt.get("TotalAsset")
+                equity_raw = stmt.get("Equity") or stmt.get("NetAssets") or stmt.get("Eq")
+                income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("OperatingProfit")
                 
-                equity = float(equity_raw) if equity_raw else 0.0
-                total_assets = float(assets_raw) if assets_raw else 0.0
+                if assets_raw is None or equity_raw is None:
+                    debug_log(f"J-Quants keys received: {list(stmt.keys())}")
+                    raise ValueError("Target keys missing in J-Quants response")
+                    
+                equity = float(equity_raw)
+                total_assets = float(assets_raw)
                 net_income = float(income_raw) if income_raw else 0.0
                 
-                if total_assets > 0 and equity > 0:
-                    equity_ratio = (equity / total_assets * 100.0)
-                    roe = (net_income / equity * 100.0)
-                else:
-                    # 【究極の防衛線】J-Quantsがデータ欠損していた場合、yfinanceへ自動フォールバック
-                    debug_log(f"J-Quants parsed 0.0 for {ticker}, falling back to yfinance...")
+                equity_ratio = (equity / total_assets * 100.0) if total_assets > 0 else 0.0
+                roe = (net_income / equity * 100.0) if equity > 0 else 0.0
+                
+            except Exception as e:
+                # 【究極の防衛線】J-Quantsが失敗した場合は yfinance に丸投げする
+                debug_log(f"J-Quants failed for {ticker} ({e}). Falling back to yfinance...")
+                try:
                     yf_ticker = f"{ticker}.T" if ticker.isdigit() else ticker
                     info = yf.Ticker(yf_ticker).info
                     
@@ -130,23 +152,23 @@ class FundamentalCache:
                     d_raw = info.get('debtToEquity', 0.0)
                     dte = float(d_raw) if d_raw is not None else 0.0
                     equity_ratio = 100.0 / (1.0 + (dte / 100.0)) if dte else 0.0
+                except Exception as ye:
+                    debug_log(f"yfinance fallback also failed for {ticker}: {ye}")
+                    roe, equity_ratio = 0.0, 0.0
                     
-                self.data[ticker] = {'roe': roe, 'equity_ratio': equity_ratio}
-            except Exception as e:
-                debug_log(f"Error calculating fundamental for {ticker}: {e}")
-                self.data[ticker] = {'roe': 0.0, 'equity_ratio': 0.0} 
+            self.data[ticker] = {'roe': roe, 'equity_ratio': equity_ratio}
             
-            # 1件ごとにキャッシュを上書き保存
+            # API制限回避のため、1件ごとに上書き保存
             try:
                 with open(self.filepath, 'w', encoding='utf-8') as f:
                     json.dump(self.data, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                debug_log(f"Failed to save cache: {e}")
+            except Exception:
+                pass
                 
         return self.data[ticker]
 
 # ==========================================
-# 1. 小型株専用・統合分析エンジン (Q-Mo Strategy)
+# 3. 小型株専用・統合分析エンジン (Q-Mo Strategy)
 # ==========================================
 class SmallCapStrategyAnalyzer:
     @staticmethod
@@ -267,7 +289,7 @@ class SmallCapStrategyAnalyzer:
         return is_entry, float(score), False
 
 # ==========================================
-# 2. 米国市場キャッシュ & ポートフォリオバックテスター
+# 4. 米国市場キャッシュ & ポートフォリオバックテスター
 # ==========================================
 class USMarketCache:
     def __init__(self) -> None:
@@ -327,7 +349,7 @@ class SmallCapPortfolioBacktester:
             df = SmallCapStrategyAnalyzer.calculate_indicators(df, bm_df)
             if df.empty: continue
             
-            # ここで必ずキャッシュから取得し、異常値なら再フェッチされる
+            # ここで必ずキャッシュから取得（浄化済みの場合は再フェッチされる）
             self.fund_cache.get_fundamentals(ticker)
             
             df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
@@ -488,7 +510,7 @@ class SmallCapPortfolioBacktester:
         }
 
 # ==========================================
-# 3. 空データ・異常値に対する堅牢性証明テスト
+# 5. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
     debug_log("Running integrity tests for Q-Mo Logic...")
@@ -528,7 +550,6 @@ def run_integrity_tests() -> None:
     debug_log("All integrity tests passed.")
 
 if __name__ == "__main__":
-    # GitHub Actions の環境変数(Secrets)から動的にAPIキーを取得する
     JQ_API_KEY = os.environ.get("JQUANTS_API_KEY", "")
     
     run_integrity_tests()
