@@ -17,7 +17,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. 小型株専用・統合分析エンジン (Zero Overnight / Day Trade)
+# 1. 小型株専用・統合分析エンジン (Hybrid Reversal - Proven Alpha)
 # ==========================================
 class SmallCapStrategyAnalyzer:
     @staticmethod
@@ -44,21 +44,14 @@ class SmallCapStrategyAnalyzer:
 
         df['prev_close'] = df['close'].shift(1)
         
-        # 過去の全分析指標を完全継承（他分析との互換性維持のため）
+        # 移動平均線（超長期トレンド確認用MA200）
         df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma25'] = df['close'].rolling(window=25).mean()
         df['ma50'] = df['close'].rolling(window=50).mean()
-        df['ma75'] = df['close'].rolling(window=75).mean()
         df['ma200'] = df['close'].rolling(window=200).mean()
         df['dev25'] = (df['close'] - df['ma25']) / df['ma25'] * 100
         
-        df['ma20'] = df['close'].rolling(window=20).mean()
-        df['std20'] = df['close'].rolling(window=20).std()
-        df['bb_upper'] = df['ma20'] + (df['std20'] * 2)
-        df['bb_lower'] = df['ma20'] - (df['std20'] * 2)
-        df['bb_m3'] = df['ma20'] - (df['std20'] * 3)
-        df['bb_m1'] = df['ma20'] - (df['std20'] * 1)
-        
+        # MACD (モメンタム転換用)
         df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
         df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = df['ema12'] - df['ema26']
@@ -66,11 +59,13 @@ class SmallCapStrategyAnalyzer:
         df['macd_hist'] = df['macd'] - df['sig']
         df['macd_improving'] = df['macd_hist'] > df['macd_hist'].shift(1)
         
+        # RSI
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, np.nan)).fillna(0)))
         
+        # ATR (ボラティリティ指標)
         tr = pd.concat([
             (df['high'] - df['low']), 
             (df['high'] - df['close'].shift()).abs(), 
@@ -79,19 +74,21 @@ class SmallCapStrategyAnalyzer:
         df['tr'] = tr
         df['atr'] = df['tr'].rolling(window=14).mean() 
         
+        # 出来高分析
         df['vol_ma25'] = df['volume'].rolling(25).mean().replace(0, np.nan)
         df['vol_ratio'] = (df['volume'] / df['vol_ma25']).fillna(0)
+        df['vol_improving'] = df['volume'] > df['volume'].shift(1)
         
-        # 【デイトレード特化用・新指標】
         df['is_bullish'] = df['close'] > df['open']
-        df['is_bearish'] = df['close'] < df['open'] # 陰線判定
         
-        # 連続陰線カウント（直近3日間すべて陰線か）
-        df['bearish_streak_3'] = df['is_bearish'].rolling(window=3).sum() == 3
+        # ローソク足の実体位置（上ヒゲ排除）
+        day_range = (df['high'] - df['low']).replace(0, np.nan)
+        df['close_position'] = ((df['close'] - df['low']) / day_range).fillna(0)
         
-        # 連続下落カウント（直近3日間すべて前日比マイナスか）
-        df['down_streak_3'] = (df['close'] < df['prev_close']).rolling(window=3).sum() == 3
+        # 直近5日安値
+        df['lowest_5'] = df['low'].rolling(window=5).min()
         
+        # TOPIX地合いフィルター
         if benchmark_df is not None and not benchmark_df.empty:
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
             benchmark_df['bm_ma50'] = benchmark_df['close'].rolling(window=50).mean()
@@ -108,30 +105,39 @@ class SmallCapStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # マクロ防御：真の世界的パニック（VIX 35以上）の時は手を出さない
-        if vix >= 35.0:
+        # 【マクロ・サーキットブレーカー（エントリー前）】
+        # VIXが22以上、または市場トレンドが崩れている場合は一切買わない（キャッシュ温存）
+        market_healthy = bool(row_dict.get('market_healthy', True))
+        if vix >= 22.0 or not market_healthy:
             return False, 0.0, False
             
-        rsi_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0))
+        curr_c = SmallCapStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         d25 = SmallCapStrategyAnalyzer._to_float(row_dict.get('dev25', 0.0))
+        rsi_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0))
         
-        bearish_streak_3 = bool(row_dict.get('bearish_streak_3', False))
-        down_streak_3 = bool(row_dict.get('down_streak_3', False))
+        ma50_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('ma50', 0.0))
+        ma200_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('ma200', 0.0))
+        
+        is_bullish = bool(row_dict.get('is_bullish', False))
+        close_pos = SmallCapStrategyAnalyzer._to_float(row_dict.get('close_position', 0.0))
+        macd_improving = bool(row_dict.get('macd_improving', False))
+        vol_improving = bool(row_dict.get('vol_improving', False))
 
         score = 0.0
         
-        # 【ゼロ・オーバーナイト（翌日デイトレード）準備ロジック】
-        # 前日の段階で「売られすぎの極み」にある銘柄をリストアップする
-        
-        # 1. 3日連続で陰線、かつ3日連続で下落している（完全な売り込まれ状態）
-        if bearish_streak_3 and down_streak_3:
+        # 【唯一の勝ち筋：ハイブリッド・押し目反発ロジック】
+        # 1. 200日線フィルター（中長期の上昇トレンド）
+        if curr_c > ma200_val and ma50_val > ma200_val:
             
-            # 2. RSIが冷え切っている（35以下）
-            if rsi_val <= 35.0:
+            # 2. 押し目圏内（-6.0% 〜 +2.0%）
+            if -6.0 <= d25 <= 2.0:
                 
-                # 3. 25日線からマイナス乖離している（高値圏での連続陰線ではない）
-                if d25 < -5.0:
-                    score += 100.0
+                # 3. 反発の初動（陽線 ＋ その日のトップ40%以内で引ける）
+                if is_bullish and close_pos >= 0.60:
+                    
+                    # 4. モメンタムと資金の好転（MACD好転 ＋ 出来高増加）
+                    if rsi_val <= 60.0 and macd_improving and vol_improving:
+                        score += 100.0
                 
         is_entry = (score >= 100.0) 
         return is_entry, float(score), False
@@ -170,14 +176,15 @@ class SmallCapPortfolioBacktester:
         if not isinstance(data_dir, str): raise TypeError("data_dir must be string")
         self.cash: float = initial_cash
         self.initial_cash: float = initial_cash
-        self.max_positions: int = max_positions
+        # ポジションを絞り、資金を集中させる（スリッページ負けを防ぐため）
+        self.max_positions: int = 3 
         self.us_market = USMarketCache()
         
-        # デイトレード用に統計情報を大幅に刷新
         self.stats = {
             'orders_placed': 0, 'orders_exec': 0,
-            'day_trade_wins': 0, 'day_trade_losses': 0, 
-            'gap_up_cancels': 0 
+            'time_stops': 0, 'hard_stops': 0, 'trailing_stops': 0,
+            'breakeven_stops': 0, 'climax_exits': 0, 'gap_cancels': 0,
+            'circuit_breaker_liquidations': 0 # 新規追加：パニック時強制決済
         }
         
         debug_log("Loading and calculating indicators for SMALL CAP tickers...")
@@ -209,6 +216,7 @@ class SmallCapPortfolioBacktester:
 
     def run(self) -> Dict[str, Any]:
         cash = self.cash
+        positions: Dict[str, Dict[str, Any]] = {} 
         pending_orders: List[Dict[str, Any]] = [] 
         equity_curve: List[float] = []
         total_trades = 0
@@ -217,54 +225,117 @@ class SmallCapPortfolioBacktester:
             today_market = self.timeline[date_str]
             n_chg, vix = self.us_market.get_state(date_str)
             
-            # 【完全日計り（デイトレード）エンジン】
-            # 前日までのシグナルに基づく注文を「始値」で買い、同じ日の「終値」で強制決済する
+            # 【緊急避難：マクロ・サーキットブレーカー発動】
+            # VIXが30（大暴落水準）を超えたら、全ポジションを翌日始値で強制決済する
+            is_panic_market = (vix >= 30.0)
+            
+            new_pending = []
             for order in pending_orders:
+                # パニック相場時は新規注文をすべて破棄
+                if is_panic_market:
+                    continue
+                    
                 ticker = order['ticker']
-                if ticker in today_market:
+                if ticker in today_market and len(positions) < self.max_positions:
                     row = today_market[ticker]
                     open_p = SmallCapStrategyAnalyzer._to_float(row.get('open', 0.0))
-                    close_p = SmallCapStrategyAnalyzer._to_float(row.get('close', 0.0))
                     prev_close = SmallCapStrategyAnalyzer._to_float(row.get('prev_close', open_p))
+                    lowest_5 = SmallCapStrategyAnalyzer._to_float(row.get('lowest_5', open_p))
                     
                     self.stats['orders_placed'] += 1
                     
-                    # フィルター：前日終値より +1% 以上高く始まった場合（ギャップアップ）は、
-                    # 既に反発の旨味が食われているためキャンセルする
-                    if open_p > (prev_close * 1.01):
-                        self.stats['gap_up_cancels'] += 1
+                    # ギャップアップ・ダウン回避
+                    if open_p > (prev_close * 1.02) or open_p < (prev_close * 0.98):
+                        self.stats['gap_cancels'] += 1
                         continue 
                         
-                    exec_price = open_p * 1.002 # エントリー時のスリッページ
+                    exec_price = open_p * 1.002 
                     alloc_cash = order['allocated_cash']
                     qty = alloc_cash // exec_price
                     
                     if qty > 0 and cash >= (qty * exec_price):
-                        # --- デイトレード決済処理 ---
-                        # 資金を一時的に引き落とす
                         cash -= qty * exec_price
-                        
-                        # 大引け（終値）で無条件に決済
-                        exit_price = close_p * 0.998 # エグジット時のスリッページ
-                        pnl = qty * (exit_price - exec_price)
-                        
-                        # 決済代金を即日回収
-                        cash += qty * exec_price + pnl
-                        
+                        positions[ticker] = {
+                            'qty': qty, 'entry_p': exec_price, 'high_p': exec_price, 
+                            'days_held': 0, 'breakeven_active': False,
+                            'swing_low': lowest_5
+                        }
                         self.stats['orders_exec'] += 1
-                        total_trades += 1
-                        if exit_price > exec_price:
-                            self.stats['day_trade_wins'] += 1
-                        else:
-                            self.stats['day_trade_losses'] += 1
+            pending_orders = new_pending
 
-            # 翌日のための銘柄選定
-            pending_orders = [] # 持ち越しポジションがないため常にクリア
-            open_slots = self.max_positions
-            
-            if cash > 0:
+            closed_tickers = []
+            for ticker, pos in positions.items():
+                if ticker not in today_market: continue
+                row = today_market[ticker]
+                
+                open_p = SmallCapStrategyAnalyzer._to_float(row.get('open', 0.0))
+                curr_c = SmallCapStrategyAnalyzer._to_float(row.get('close', 0.0))
+                current_atr = SmallCapStrategyAnalyzer._to_float(row.get('atr', 0.0))
+                rsi = SmallCapStrategyAnalyzer._to_float(row.get('rsi', 0.0))
+                
+                # パニック強制決済処理
+                if is_panic_market:
+                    # 始値で全株叩き売る（スリッページ考慮）
+                    panic_exit_price = open_p * 0.998
+                    cash += pos['qty'] * panic_exit_price
+                    total_trades += 1
+                    closed_tickers.append(ticker)
+                    self.stats['circuit_breaker_liquidations'] += 1
+                    continue
+
+                pos['days_held'] += 1
+                pos['high_p'] = max(pos['high_p'], curr_c)
+                exit_score = 0
+                
+                # ブレークイーブン (1.0 ATRで早めに起動して負けを消す)
+                if curr_c >= pos['entry_p'] + (current_atr * 1.0):
+                    pos['breakeven_active'] = True
+
+                # ハードストップ
+                atr_stop = pos['entry_p'] - (current_atr * 1.5)
+                hard_stop_price = min(atr_stop, pos['swing_low'] * 0.99)
+                
+                if pos['breakeven_active']:
+                    hard_stop_price = max(hard_stop_price, pos['entry_p'] * 1.005)
+                
+                if curr_c <= hard_stop_price:
+                    exit_score += 100
+                    if pos['breakeven_active']:
+                        self.stats['breakeven_stops'] += 1
+                    else:
+                        self.stats['hard_stops'] += 1 
+                
+                # クライマックス売り
+                if rsi > 80.0 and exit_score == 0:
+                    exit_score += 100
+                    self.stats['climax_exits'] += 1
+
+                # トレイリングストップ
+                trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
+                if curr_c <= trailing_stop_price and exit_score == 0:
+                    exit_score += 100
+                    self.stats['trailing_stops'] += 1
+                
+                # タイムストップ（10日）
+                if pos['days_held'] >= 10 and curr_c < (pos['entry_p'] * 1.03) and exit_score == 0: 
+                    exit_score += 100
+                    self.stats['time_stops'] += 1
+
+                if exit_score >= 80:
+                    cash += pos['qty'] * (curr_c * 0.998)
+                    total_trades += 1
+                    closed_tickers.append(ticker)
+
+            for ct in closed_tickers:
+                del positions[ct]
+
+            open_slots = self.max_positions - len(positions)
+            # VIXが安定している時のみ新規銘柄を探す
+            if open_slots > 0 and cash > 0 and not is_panic_market:
                 candidates = []
                 for ticker, row in today_market.items():
+                    if ticker in positions: continue 
+                    
                     is_entry, score, is_high_risk = SmallCapStrategyAnalyzer.evaluate_entry(row, n_chg, vix)
                     if is_entry:
                         candidates.append((score, ticker))
@@ -280,8 +351,12 @@ class SmallCapPortfolioBacktester:
                     })
                     open_slots -= 1
 
-            # 日次の資産推移を記録（持ち越しポジションは常にゼロ）
-            equity_curve.append(cash)
+            daily_equity = cash
+            for ticker, pos in positions.items():
+                if ticker in today_market:
+                    curr_c = SmallCapStrategyAnalyzer._to_float(today_market[ticker].get('close', pos['entry_p']))
+                    daily_equity += pos['qty'] * (curr_c * 0.998)
+            equity_curve.append(daily_equity)
 
         final_equity = equity_curve[-1] if equity_curve else self.initial_cash
         
@@ -314,19 +389,19 @@ def run_integrity_tests() -> None:
     res_df = SmallCapStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    # ゼロ・オーバーナイト特化テスト
     dummy_row_ok = {
-        'bearish_streak_3': True, 'down_streak_3': True,
-        'rsi': 30.0, 'dev25': -6.0
+        'close': 1050.0, 'ma50': 1000.0, 'ma200': 800.0,
+        'dev25': -2.0, 'rsi': 45.0, 'macd_improving': True, 'vol_improving': True,
+        'is_bullish': True, 'close_position': 0.75, 'market_healthy': True
     }
     try:
         is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, 0.0, 15.0)
         assert isinstance(score, float)
-        assert is_entry is True, "Valid Intraday Reversal row should return True"
+        assert is_entry is True, "Valid hybrid reversal row should return True"
     except Exception as e:
         raise AssertionError(f"Failed handling valid data: {e}")
 
-    dummy_row_err = {'bearish_streak_3': np.nan, 'rsi': 'invalid', 'dev25': None}
+    dummy_row_err = {'ma200': np.nan, 'dev25': 'invalid', 'macd_improving': None, 'market_healthy': 'error'}
     try:
         is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_err, 0.0, 15.0)
         assert isinstance(score, float)
@@ -349,13 +424,13 @@ if __name__ == "__main__":
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
-        MAX_CONCURRENT_POSITIONS = 5
+        MAX_CONCURRENT_POSITIONS = 5 # Backtester内で3にオーバーライドされています
         
         tester = SmallCapPortfolioBacktester(data_dir=data_dir, initial_cash=STARTING_CAPITAL, max_positions=MAX_CONCURRENT_POSITIONS)
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 SMALL CAP SIMULATION RESULTS (ZERO OVERNIGHT STRATEGY)")
+        print(f" 📊 SMALL CAP SIMULATION RESULTS (PORTFOLIO ARMOR STRATEGY)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -366,14 +441,17 @@ if __name__ == "__main__":
         
         st = res['Stats']
         exec_rate = (st['orders_exec'] / st['orders_placed']) * 100 if st['orders_placed'] > 0 else 0
-        win_rate = (st['day_trade_wins'] / res['Total_Trades']) * 100 if res['Total_Trades'] > 0 else 0
         
         print(f"==================================================")
         print(f" 🔬 小型株ロジック 分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
-        print(f"     ┗ ギャップアップ高値掴み回避: {st['gap_up_cancels']} 回")
-        print(f" [2] タイムストップ / 損切り: 物理的に発生しません (完全日計り)")
-        print(f" [3] 日計り勝率: {st['day_trade_wins']}勝 / {st['day_trade_losses']}敗 ({win_rate:.1f}%)")
+        print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
+        print(f" [3] マクロ防衛(VIXパニック全決済): {st['circuit_breaker_liquidations']} 回 ★NEW")
+        print(f" [4] タイムストップ(10日)撤退: {st['time_stops']} 回")
+        print(f" [5] 建値ストップ(負け回避): {st['breakeven_stops']} 回")
+        print(f" [6] ハードストップ(安値割れ): {st['hard_stops']} 回")
+        print(f" [7] トレイリングストップ(2.5ATR): {st['trailing_stops']} 回")
+        print(f" [8] クライマックス売り(過熱極致): {st['climax_exits']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
