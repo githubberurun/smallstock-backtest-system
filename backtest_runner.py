@@ -53,7 +53,6 @@ class SmallCapStrategyAnalyzer:
         df['bb_p1'] = df['ma20'] + df['std20'] 
         df['prev_low'] = df['low'].shift(1)
         
-        # 小型株は値動きが激しいため、MACDの反応を重視
         df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
         df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = df['ema12'] - df['ema26']
@@ -91,7 +90,6 @@ class SmallCapStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # 小型株特有のマクロフィルター（大型株より少し緩め、または独自設定をテストするため）
         if n_chg <= -3.0 or vix >= 35.0:
             return False, 0.0, False
             
@@ -102,16 +100,14 @@ class SmallCapStrategyAnalyzer:
         macd_improving = bool(row_dict.get('macd_improving', False))
         d25 = SmallCapStrategyAnalyzer._to_float(row_dict.get('dev25', 0.0))
 
-        # 小型株特有の「ナイフ落下」排除（-20%以上の乖離は危険とみなす）
         if d25 <= -20.0:
             return False, 0.0, False
 
         score = 0.0
-        # 出来高急増（大商い）を伴う反発を狙うベースロジック
         if rsi_val < 35.0 and is_bullish:
             score += 50.0
             if macd_improving and vol_ratio >= 1.5:
-                score += 50.0 # 出来高クライマックス + MACD好転で満点
+                score += 50.0 
                 
         is_entry = (score >= 80.0)
         return is_entry, float(score), (vix >= 20.0)
@@ -122,10 +118,9 @@ class SmallCapStrategyAnalyzer:
         curr_price = SmallCapStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = SmallCapStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        # 小型株の指値は大型株より「深く」設定（下ヒゲを拾う）
         base_offset = 1.0 
         if is_high_risk:
-            base_offset = 2.0 # パニック時は2.0ATR下という極端な深さで待つ
+            base_offset = 2.0 
             
         nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -1.0 else 0.0
         limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
@@ -185,7 +180,6 @@ class SmallCapPortfolioBacktester:
         
         for file in files:
             ticker = file.replace(".parquet", "")
-            # 注: 実際のバックテスト時は、小型株(時価総額500億未満)のリストのみを読み込ませる想定
             df = pd.read_parquet(f"{data_dir}/{file}")
             df = SmallCapStrategyAnalyzer.calculate_indicators(df, bm_df)
             if df.empty: continue
@@ -257,7 +251,6 @@ class SmallCapPortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
                 
-                # 小型株専用: 絶対損失キャップ(-20%) または 深めのハードストップ(3.0ATR)
                 hard_stop_price_atr = pos['entry_p'] - (current_atr * 3.0)
                 hard_stop_price_abs = pos['entry_p'] * 0.80 
                 hard_stop_price = max(hard_stop_price_atr, hard_stop_price_abs)
@@ -266,18 +259,15 @@ class SmallCapPortfolioBacktester:
                     exit_score += 100
                     self.stats['hard_stops'] += 1
                 
-                # 小型株専用: クライマックス売り (テンバガー極致)
                 if dev25 > 50.0 and rsi > 90.0 and vol_ratio >= 3.0 and exit_score == 0:
                     exit_score += 100
                     self.stats['climax_exits'] += 1
 
-                # 小型株専用: 広いトレイリングストップ (3.5ATR)
                 trailing_stop_price = pos['high_p'] - (current_atr * 3.5)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                # 小型株専用: 長めのタイムストップ (20日)
                 if pos['days_held'] >= 20 and curr_c < (pos['entry_p'] * 1.05) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
@@ -303,7 +293,6 @@ class SmallCapPortfolioBacktester:
                 
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 
-                # 時間分散（小型株もパニック時は制限）
                 is_high_risk = vix >= 20.0
                 max_daily_new_orders = 2 if is_high_risk else self.max_positions
                 allowed_slots_today = min(open_slots, max_daily_new_orders)
@@ -371,10 +360,8 @@ if __name__ == "__main__":
     try:
         data_dir = "Colog_github"
         if not os.path.exists(data_dir):
-            data_dir = "data" # フォールバック
-            if not os.path.exists(data_dir):
-                print(f"[ERROR] Directory not found. Run data fetcher first.")
-                exit(1)
+            print(f"[ERROR] Directory '{data_dir}' not found. Run data fetcher first.")
+            exit(1)
             
         print("\n==================================================")
         print(" 🚀 STARTING SMALL CAP PORTFOLIO BACKTEST")
