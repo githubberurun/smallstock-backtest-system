@@ -21,59 +21,38 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. J-Quants API v2 クライアント (リフレッシュトークン方式修正版)
+# 1. J-Quants API v2 クライアント (APIキー直接指定方式)
 # ==========================================
 class JQuantsV2Client:
     """JPX公式 J-Quants API v2 クライアント"""
     def __init__(self, api_key: str):
         if not isinstance(api_key, str): raise TypeError("api_key must be string")
-        if not api_key: raise ValueError("API Key (Refresh Token) is required")
+        if not api_key: raise ValueError("API Key is required")
         self.api_key: str = api_key
-        self.id_token: str = ""
-        self.base_url: str = "https://api.jquants.com/v1" 
-        self._refresh_id_token()
-
-    def _refresh_id_token(self) -> None:
-        """リフレッシュトークンを使用してIDトークンを取得・更新する"""
-        # 修正: auth_refreshエンドポイントにクエリパラメータとしてトークンを渡す
-        url = f"{self.base_url}/token/auth_refresh?refreshtoken={self.api_key}"
-        try:
-            res = requests.post(url, timeout=15)
-            res.raise_for_status()
-            self.id_token = res.json().get("idToken", "")
-            if self.id_token:
-                debug_log("Successfully authenticated with J-Quants API.")
-            else:
-                debug_log("Warning: Authentication succeeded but idToken is empty.")
-        except Exception as e:
-            debug_log(f"Failed J-Quants v2 Auth: {e}")
-            self.id_token = ""
+        # 2025年12月以降のV2エンドポイント
+        self.base_url: str = "https://api.jquants.com/v2" 
 
     def get_statements(self, ticker: str) -> Dict[str, Any]:
-        """最新の財務諸表（短信）を取得する"""
+        """最新の財務諸表（短信サマリー）を取得する"""
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
-        if not self.id_token: 
-            self._refresh_id_token()
-            if not self.id_token: return {}
         
-        # 修正: 財務情報の公式エンドポイントは /fins/statements
-        url = f"{self.base_url}/fins/statements?code={ticker}"
-        headers = {"Authorization": f"Bearer {self.id_token}"}
+        # V2仕様: x-api-keyヘッダにAPIキーを直接指定（トークン発行は廃止）
+        headers = {"x-api-key": self.api_key}
+        
+        # V2財務情報エンドポイント
+        url = f"{self.base_url}/fins/summary?code={ticker}"
         
         try:
             res = requests.get(url, headers=headers, timeout=15)
-            if res.status_code == 401: # トークン切れの自動再試行
-                self._refresh_id_token()
-                headers["Authorization"] = f"Bearer {self.id_token}"
-                res = requests.get(url, headers=headers, timeout=15)
-            
             res.raise_for_status()
-            data = res.json().get("statements", [])
+            
+            # V2仕様: レスポンスは "data" キーの配列として返却される
+            data = res.json().get("data", [])
             if not data:
                 return {}
             
             # 複数ある場合は DisclosedDate でソートして最新（配列の最後）を取得
-            data.sort(key=lambda x: x.get("DisclosedDate", ""))
+            data.sort(key=lambda x: str(x.get("DisclosedDate", "")))
             return data[-1]
             
         except Exception as e:
@@ -81,7 +60,7 @@ class JQuantsV2Client:
             return {}
 
 # ==========================================
-# ファンダメンタルズ・キャッシュマネージャー（J-Quants統合・自動修復版）
+# ファンダメンタルズ・キャッシュマネージャー（自動修復版）
 # ==========================================
 class FundamentalCache:
     """J-Quantsからの情報取得負荷を下げるためのローカルキャッシュ"""
@@ -105,7 +84,7 @@ class FundamentalCache:
     def get_fundamentals(self, ticker: str) -> Dict[str, float]:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
-        # 【自動修復ロジック】キャッシュが存在しない、または前回エラー時の 0.0 データの場合は再取得
+        # 【自動修復ロジック】キャッシュが存在しない、または前回のエラーで 0.0 の場合は再取得
         needs_fetch = False
         if ticker not in self.data:
             needs_fetch = True
@@ -113,14 +92,14 @@ class FundamentalCache:
             needs_fetch = True
             
         if needs_fetch:
-            debug_log(f"Fetching fundamentals for {ticker} from J-Quants...")
+            debug_log(f"Fetching fundamentals for {ticker} from J-Quants V2...")
             try:
                 stmt = self.jq_client.get_statements(ticker)
                 
-                # 修正: J-Quantsのキーに合わせて取得 (Profit: 純利益, Equity: 自己資本, TotalAssets: 総資産)
-                equity_raw = stmt.get("Equity")
-                assets_raw = stmt.get("TotalAssets")
-                income_raw = stmt.get("Profit")
+                # J-Quantsのキーに合わせて取得 (Profit: 純利益, Equity: 自己資本, TotalAssets: 総資産)
+                equity_raw = stmt.get("Equity") or stmt.get("equity")
+                assets_raw = stmt.get("TotalAssets") or stmt.get("total_assets")
+                income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("profit")
                 
                 # Noneや空文字に対する堅牢なパース
                 equity = float(equity_raw) if equity_raw else 0.0
@@ -138,7 +117,7 @@ class FundamentalCache:
                 debug_log(f"Error calculating fundamental for {ticker}: {e}")
                 self.data[ticker] = {'roe': 0.0, 'equity_ratio': 0.0} 
             
-            # API制限・消失回避のため、1件ごとに保存
+            # API制限回避・データ永続化のため、1件ごとに保存
             try:
                 with open(self.filepath, 'w', encoding='utf-8') as f:
                     json.dump(self.data, f, ensure_ascii=False, indent=2)
@@ -175,7 +154,6 @@ class SmallCapStrategyAnalyzer:
 
         df['prev_close'] = df['close'].shift(1)
         
-        # 過去指標の完全継承
         df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma25'] = df['close'].rolling(window=25).mean()
         df['ma50'] = df['close'].rolling(window=50).mean()
