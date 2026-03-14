@@ -18,7 +18,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# ファンダメンタルズ・キャッシュマネージャー
+# ファンダメンタルズ・キャッシュマネージャー（自動修復版）
 # ==========================================
 class FundamentalCache:
     """yfinanceからの情報取得負荷を下げるためのローカルキャッシュ"""
@@ -39,10 +39,17 @@ class FundamentalCache:
     def get_fundamentals(self, ticker: str) -> Dict[str, float]:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
+        # 【自動修復ロジック】キャッシュが存在しない、または前回エラー時の 0.0 データの場合は再取得
+        needs_fetch = False
         if ticker not in self.data:
+            needs_fetch = True
+        elif self.data[ticker].get('roe', 0.0) == 0.0 and self.data[ticker].get('equity_ratio', 0.0) == 0.0:
+            needs_fetch = True
+            
+        if needs_fetch:
             debug_log(f"Fetching fundamentals for {ticker}...")
             try:
-                # 【修正箇所】日本株の場合は末尾に '.T' を付与して yfinance に問い合わせる
+                # 日本株の場合は末尾に '.T' を付与して yfinance に問い合わせる
                 yf_ticker = f"{ticker}.T" if ticker.isdigit() else ticker
                 info = yf.Ticker(yf_ticker).info
                 
@@ -58,9 +65,9 @@ class FundamentalCache:
                 self.data[ticker] = {'roe': roe, 'equity_ratio': equity_ratio}
             except Exception as e:
                 debug_log(f"Error fetching fundamental for {ticker}: {e}")
-                self.data[ticker] = {'roe': 0.0, 'equity_ratio': 0.0} # 取得失敗時は0（足切り対象）
+                self.data[ticker] = {'roe': 0.0, 'equity_ratio': 0.0} 
             
-            # API制限回避とクラッシュ対策のため、1件ごとに保存
+            # API制限回避のため、1件ごとに保存
             try:
                 with open(self.filepath, 'w', encoding='utf-8') as f:
                     json.dump(self.data, f, ensure_ascii=False, indent=2)
@@ -173,7 +180,7 @@ class SmallCapStrategyAnalyzer:
         roe = SmallCapStrategyAnalyzer._to_float(fund_data.get('roe', 0.0))
         eq_ratio = SmallCapStrategyAnalyzer._to_float(fund_data.get('equity_ratio', 0.0))
         
-        # ゾンビ企業は問答無用で排除
+        # ゾンビ企業は排除（ROE 10%以上、自己資本比率 50%以上）
         if roe < 10.0 or eq_ratio < 50.0:
             return False, 0.0, False 
             
@@ -189,10 +196,8 @@ class SmallCapStrategyAnalyzer:
         score = 0.0
         
         # 【Momentum（勢い）ロジック】
-        # 1. パーフェクトオーダー（MA25 > MA50 > MA200）の強いトレンド
         if curr_c > ma25_val and ma25_val > ma50_val and ma50_val > ma200_val:
-            
-            # 2. 出来高を伴う上昇を確認（出来高平均2倍以上 ＋ 上位70%以上の陽線引け）
+            # 出来高を伴う上昇を確認（出来高平均2倍以上 ＋ 上位70%以上の陽線引け）
             if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70:
                 score += 100.0
                 
@@ -258,7 +263,7 @@ class SmallCapPortfolioBacktester:
             df = SmallCapStrategyAnalyzer.calculate_indicators(df, bm_df)
             if df.empty: continue
             
-            # キャッシュからファンダを取得（なければ.T付与で取得・保存）
+            # キャッシュからファンダを取得（不良データの場合は.T付与で再取得・保存される）
             self.fund_cache.get_fundamentals(ticker)
             
             df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
@@ -272,6 +277,10 @@ class SmallCapPortfolioBacktester:
                 
         self.sorted_dates = sorted(list(dates_set))
         debug_log(f"Timeline built. Total trading days: {len(self.sorted_dates)}")
+        
+        # 【重要デバッグ】真の優良企業が全体のうち何社あるかを可視化
+        passed_tickers = [t for t, data in self.fund_cache.data.items() if data.get('roe', 0.0) >= 10.0 and data.get('equity_ratio', 0.0) >= 50.0]
+        debug_log(f"★ Quality Filter Passed Tickers (ROE>=10%, Eq>=50%): {len(passed_tickers)} / {len(self.fund_cache.data)}")
 
     def run(self) -> Dict[str, Any]:
         cash = self.cash
