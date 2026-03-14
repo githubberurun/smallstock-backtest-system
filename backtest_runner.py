@@ -17,7 +17,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. 小型株専用・統合分析エンジン (VCP / Squeeze Breakout)
+# 1. 小型株専用・統合分析エンジン (Minervini Trend Template & VCP)
 # ==========================================
 class SmallCapStrategyAnalyzer:
     @staticmethod
@@ -44,10 +44,14 @@ class SmallCapStrategyAnalyzer:
 
         df['prev_close'] = df['close'].shift(1)
         
-        # 移動平均線（長期トレンド確認用）
+        # 移動平均線（超長期トレンド確認用MA200を追加）
+        df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma25'] = df['close'].rolling(window=25).mean()
         df['ma50'] = df['close'].rolling(window=50).mean()
         df['ma75'] = df['close'].rolling(window=75).mean()
+        df['ma200'] = df['close'].rolling(window=200).mean() # ミネルヴィニ・フィルターの要
+        
+        df['dev25'] = (df['close'] - df['ma25']) / df['ma25'] * 100
         
         # ボリンジャーバンドとスクイーズ（収縮）判定
         df['ma20'] = df['close'].rolling(window=20).mean()
@@ -57,7 +61,6 @@ class SmallCapStrategyAnalyzer:
         
         # バンド幅（%）
         df['bb_width'] = ((df['bb_upper'] - df['bb_lower']) / df['ma20']) * 100
-        # 過去5日間のバンド幅の最小値（静寂の確認）
         df['bb_width_min_5'] = df['bb_width'].rolling(window=5).min().shift(1)
         
         # RSI
@@ -88,15 +91,33 @@ class SmallCapStrategyAnalyzer:
         
         df['is_bullish'] = df['close'] > df['open']
         
-        # TOPIX地合いフィルター
+        # ローソク足の実体位置
+        day_range = (df['high'] - df['low']).replace(0, np.nan)
+        df['close_position'] = ((df['close'] - df['low']) / day_range).fillna(0)
+        
+        # 下ヒゲ関連（過去機能継承）
+        df['body'] = (df['close'] - df['open']).abs()
+        df['lower_shadow'] = df[['open', 'close']].min(axis=1) - df['low']
+        df['long_lower_shadow'] = df['lower_shadow'] > (df['body'] * 1.5)
+        
+        # TOPIX地合いフィルター（厳格化）
         if benchmark_df is not None and not benchmark_df.empty:
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
             benchmark_df['bm_ma25'] = benchmark_df['close'].rolling(window=25).mean()
-            benchmark_df['market_healthy'] = benchmark_df['close'] > benchmark_df['bm_ma25']
+            benchmark_df['bm_ma50'] = benchmark_df['close'].rolling(window=50).mean()
+            # 【市場フィルター強化】TOPIX自体が完全な上昇トレンドであること
+            benchmark_df['market_healthy'] = (benchmark_df['close'] > benchmark_df['bm_ma25']) & (benchmark_df['bm_ma25'] > benchmark_df['bm_ma50'])
+            
             df = df.merge(benchmark_df[['date', 'market_healthy']], on='date', how='left')
             df['market_healthy'] = df['market_healthy'].ffill().fillna(False)
+            
+            # 相対強度 (Relative Strength)
+            df = df.merge(benchmark_df[['date', 'close']], on='date', how='left', suffixes=('', '_bm'))
+            df['close_bm'] = df['close_bm'].ffill()
+            df['rs_21'] = (df['close'].pct_change(21) - df['close_bm'].pct_change(21)) * 100
         else:
             df['market_healthy'] = True
+            df['rs_21'] = 0.0
 
         return df
 
@@ -104,37 +125,43 @@ class SmallCapStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # マクロ防御：地合いが悪い時は手を出さない
+        # マクロ防御：市場環境が完璧でない場合は一切手を出さない
         market_healthy = bool(row_dict.get('market_healthy', True))
-        if vix >= 25.0 or n_chg <= -1.5 or not market_healthy:
+        if vix >= 25.0 or n_chg <= -1.0 or not market_healthy:
             return False, 0.0, False
             
         curr_c = SmallCapStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         vol_ratio = SmallCapStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0), 1.0)
         is_bullish = bool(row_dict.get('is_bullish', False))
+        close_pos = SmallCapStrategyAnalyzer._to_float(row_dict.get('close_position', 0.0))
+        rs_21 = SmallCapStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0))
         
         ma50_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('ma50', 0.0))
         ma75_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('ma75', 0.0))
+        ma200_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('ma200', 0.0))
         
         bb_upper_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('bb_upper', float('inf')))
         bb_width_min_5 = SmallCapStrategyAnalyzer._to_float(row_dict.get('bb_width_min_5', 100.0))
 
         score = 0.0
         
-        # 【VCP / スクイーズ・ブレイクアウト ロジック】
+        # 【ミネルヴィニ・トレンドテンプレート ＆ VCPロジック】
         
-        # 1. ベースとなる長期トレンドが上向きであること（50日線 > 75日線）
-        if ma50_val > ma75_val and curr_c > ma50_val:
+        # 1. 絶対的トレンド条件（超長期〜中期が全てパーフェクトオーダー）
+        if curr_c > ma50_val and ma50_val > ma75_val and ma75_val > ma200_val:
             
-            # 2. 静寂の確認：直近5日間のボリンジャーバンド幅が15%未満に「収縮（スクイーズ）」していた
-            if bb_width_min_5 < 15.0:
-                
-                # 3. エクスパンション（爆発）：終値がボリンジャーバンドの+2σ（上限）を突き抜けた
-                if curr_c > bb_upper_val and is_bullish:
+            # 2. TOPIXをアウトパフォームしている（相対的強度がプラス）
+            if rs_21 > 0.0:
+            
+                # 3. ボリンジャーバンド幅の極限収縮（10%未満の究極の静寂）
+                if bb_width_min_5 < 10.0:
                     
-                    # 4. 機関投資家の介入痕跡：出来高が25日平均の 2.0倍 以上に急増している
-                    if vol_ratio >= 2.0:
-                        score += 100.0
+                    # 4. ブレイクアウト（+2σ上抜け）と強い陽線（上ヒゲ排除：実体が上位80%以上）
+                    if curr_c > bb_upper_val and is_bullish and close_pos >= 0.80:
+                        
+                        # 5. 大口の資金流入痕跡（出来高2.5倍以上）
+                        if vol_ratio >= 2.5:
+                            score += 100.0
                 
         is_entry = (score >= 100.0) 
         return is_entry, float(score), False
@@ -260,11 +287,11 @@ class SmallCapPortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
                 
-                # ブレークイーブン機構 (含み益 1.5 ATRで建値ストップ起動)
+                # ブレークイーブン機構 (1.5 ATRで起動)
                 if curr_c >= pos['entry_p'] + (current_atr * 1.5):
                     pos['breakeven_active'] = True
 
-                # 【防衛力】ブレイクアウトが失敗して元に戻ったら即損切り (1.5 ATR)
+                # ハードストップ (1.5 ATR)
                 hard_stop_price = pos['entry_p'] - (current_atr * 1.5)
                 
                 if pos['breakeven_active']:
@@ -277,19 +304,19 @@ class SmallCapPortfolioBacktester:
                     else:
                         self.stats['hard_stops'] += 1 
                 
-                # クライマックス売り (RSI過熱)
+                # クライマックス売り (RSIが85を超えたら利確)
                 if rsi > 85.0 and exit_score == 0:
                     exit_score += 100
                     self.stats['climax_exits'] += 1
 
-                # トレイリングストップ (トレンドを伸ばすため少し広めの 3.0 ATR)
+                # トレイリングストップ (3.0 ATR)
                 trailing_stop_price = pos['high_p'] - (current_atr * 3.0)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                # タイムストップ（8日）スクイーズからのブレイクはすぐに結果が出る
-                if pos['days_held'] >= 8 and curr_c < (pos['entry_p'] * 1.02) and exit_score == 0: 
+                # タイムストップ（5日）ブレイクアウトは即日〜数日で結果が出るはず
+                if pos['days_held'] >= 5 and curr_c < (pos['entry_p'] * 1.02) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
 
@@ -313,7 +340,6 @@ class SmallCapPortfolioBacktester:
                 
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 
-                # 厳選された銘柄のみエントリー
                 allowed_slots_today = min(open_slots, self.max_positions)
                 
                 for score, ticker in candidates[:allowed_slots_today]:
@@ -363,18 +389,18 @@ def run_integrity_tests() -> None:
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
     dummy_row_ok = {
-        'close': 1050.0, 'ma50': 1000.0, 'ma75': 950.0,
-        'bb_width_min_5': 10.0, 'bb_upper': 1040.0,
-        'vol_ratio': 2.5, 'is_bullish': True, 'market_healthy': True
+        'close': 1050.0, 'ma50': 1000.0, 'ma75': 950.0, 'ma200': 800.0,
+        'rs_21': 5.0, 'bb_width_min_5': 8.0, 'bb_upper': 1040.0,
+        'vol_ratio': 3.0, 'is_bullish': True, 'close_position': 0.85, 'market_healthy': True
     }
     try:
         is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, 0.0, 15.0)
         assert isinstance(score, float)
-        assert is_entry is True, "Valid VCP breakout row should return True"
+        assert is_entry is True, "Valid Minervini breakout row should return True"
     except Exception as e:
         raise AssertionError(f"Failed handling valid data: {e}")
 
-    dummy_row_err = {'ma50': np.nan, 'bb_width_min_5': 'invalid', 'vol_ratio': None, 'market_healthy': 'error'}
+    dummy_row_err = {'ma200': np.nan, 'bb_width_min_5': 'invalid', 'vol_ratio': None, 'market_healthy': 'error'}
     try:
         is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_err, 0.0, 15.0)
         assert isinstance(score, float)
@@ -403,7 +429,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 SMALL CAP SIMULATION RESULTS (VCP SQUEEZE STRATEGY)")
+        print(f" 📊 SMALL CAP SIMULATION RESULTS (MINERVINI FILTER STRATEGY)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -419,7 +445,7 @@ if __name__ == "__main__":
         print(f" 🔬 小型株ロジック 分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f"     ┗ 危険なギャップダウン回避: {st['gap_down_cancels']} 回")
-        print(f" [2] タイムストップ(8日)撤退: {st['time_stops']} 回")
+        print(f" [2] タイムストップ(5日)撤退: {st['time_stops']} 回")
         print(f" [3] 建値ストップ(負け回避): {st['breakeven_stops']} 回")
         print(f" [4] ハードストップ(-1.5ATR): {st['hard_stops']} 回")
         print(f" [5] トレイリングストップ(3.0ATR): {st['trailing_stops']} 回")
