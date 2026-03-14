@@ -40,8 +40,7 @@ class SmallCapStrategyAnalyzer:
         df.columns = [str(c).lower() for c in df.columns]
         required_cols = {'open', 'high', 'low', 'close', 'volume'}
         if not required_cols.issubset(set(df.columns)):
-            missing = required_cols - set(df.columns)
-            raise KeyError(f"DataFrameに必須列が不足しています: {missing}")
+            raise KeyError(f"DataFrameに必須列が不足しています: {required_cols - set(df.columns)}")
 
         df['prev_close'] = df['close'].shift(1)
         df['ma5'] = df['close'].rolling(window=5).mean()
@@ -50,10 +49,9 @@ class SmallCapStrategyAnalyzer:
         df['ma20'] = df['close'].rolling(window=20).mean()
         df['std20'] = df['close'].rolling(window=20).std()
         df['bb_up_3'] = df['ma20'] + (df['std20'] * 3)
-        df['bb_p1'] = df['ma20'] + df['std20'] 
         df['prev_low'] = df['low'].shift(1)
         
-        # 小型株は値動きが激しいため、MACDの反応を重視
+        # MACD (反応速度重視)
         df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
         df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = df['ema12'] - df['ema26']
@@ -61,11 +59,13 @@ class SmallCapStrategyAnalyzer:
         df['macd_hist'] = df['macd'] - df['sig']
         df['macd_improving'] = df['macd_hist'] > df['macd_hist'].shift(1)
         
+        # RSI
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, np.nan)).fillna(0)))
         
+        # ボラティリティ指標 (ATR)
         tr = pd.concat([
             (df['high'] - df['low']), 
             (df['high'] - df['close'].shift()).abs(), 
@@ -73,7 +73,10 @@ class SmallCapStrategyAnalyzer:
         ], axis=1).max(axis=1)
         df['tr'] = tr
         df['atr'] = df['tr'].rolling(window=14).mean() 
+        
+        # 出来高の急増（反発の兆候）を捉える
         df['vol_ratio'] = (df['volume'] / df['volume'].rolling(25).mean().replace(0, np.nan)).fillna(0)
+        df['vol_improving'] = df['volume'] > df['volume'].shift(1)
         
         df['is_bullish'] = df['close'] > df['open']
 
@@ -91,27 +94,32 @@ class SmallCapStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # 小型株特有のマクロフィルター
+        # 米国市場の暴落時は手を出さない
         if n_chg <= -3.0 or vix >= 35.0:
             return False, 0.0, False
             
-        curr_c = SmallCapStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         rsi_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0), 50.0)
         vol_ratio = SmallCapStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0), 1.0)
         is_bullish = bool(row_dict.get('is_bullish', False))
         macd_improving = bool(row_dict.get('macd_improving', False))
         d25 = SmallCapStrategyAnalyzer._to_float(row_dict.get('dev25', 0.0))
+        vol_improving = bool(row_dict.get('vol_improving', False))
 
-        # 小型株特有の「ナイフ落下」排除
-        if d25 <= -20.0:
+        # 【改修点1】落ちるナイフの回避
+        # 単にRSIが低いだけでなく、極端な異常暴落(-25%超)は倒産リスク等のため排除
+        if d25 <= -25.0:
             return False, 0.0, False
 
         score = 0.0
-        # 出来高急増（大商い）を伴う反発を狙うベースロジック
-        if rsi_val < 35.0 and is_bullish:
-            score += 50.0
-            if macd_improving and vol_ratio >= 1.5:
-                score += 50.0 # 出来高クライマックス + MACD好転で満点
+        # 【改修点2】「反発の兆し」を厳格に要求する
+        # 下落トレンド中（d25 < -5.0）かつ売られすぎ（RSI < 40）で、陽線で出来高が前日より増えていることを重視
+        if rsi_val < 40.0 and d25 < -5.0:
+            if is_bullish:
+                score += 40.0 # 陽線（買い勢力の出現）
+            if vol_improving and vol_ratio >= 1.2:
+                score += 30.0 # 出来高増（機関投資家などの買い戻し示唆）
+            if macd_improving:
+                score += 30.0 # 短期モメンタムの好転
                 
         is_entry = (score >= 80.0)
         return is_entry, float(score), (vix >= 20.0)
@@ -122,10 +130,11 @@ class SmallCapStrategyAnalyzer:
         curr_price = SmallCapStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = SmallCapStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        # 小型株の指値は大型株より「深く」設定
-        base_offset = 1.0 
+        # 【改修点3】約定率アップ
+        # 指値を少し浅くし、チャンスを取りこぼさないようにする
+        base_offset = 0.5 
         if is_high_risk:
-            base_offset = 2.0 
+            base_offset = 1.0 
             
         nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -1.0 else 0.0
         limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
@@ -264,16 +273,22 @@ class SmallCapPortfolioBacktester:
                     exit_score += 100
                     self.stats['hard_stops'] += 1
                 
-                if dev25 > 50.0 and rsi > 90.0 and vol_ratio >= 3.0 and exit_score == 0:
+                # 【改修点4】クライマックス売り判定の大幅緩和
+                # 乖離率+25%以上、RSI>75、出来高急増(2倍)で早めに利益確定
+                if dev25 > 25.0 and rsi > 75.0 and vol_ratio >= 2.0 and exit_score == 0:
                     exit_score += 100
                     self.stats['climax_exits'] += 1
 
-                trailing_stop_price = pos['high_p'] - (current_atr * 3.5)
+                # 【改修点5】トレイリングストップの引き締め (MDD対策)
+                # 3.5ATR -> 2.5ATR に変更し、得た利益を失わないようにする
+                trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                if pos['days_held'] >= 20 and curr_c < (pos['entry_p'] * 1.05) and exit_score == 0: 
+                # 【改修点6】タイムストップの短縮 (資金効率対策)
+                # 20日 -> 12日 に短縮。12営業日経っても利益が出ない銘柄は見切る
+                if pos['days_held'] >= 12 and curr_c < (pos['entry_p'] * 1.05) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
 
@@ -345,11 +360,9 @@ class SmallCapPortfolioBacktester:
 # ==========================================
 def run_integrity_tests() -> None:
     debug_log("Running integrity tests for Small Cap Logic...")
-    
     empty_df = pd.DataFrame()
     res_df = SmallCapStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
-    
     dummy_row_err = {'rsi': np.nan, 'dev25': 'invalid', 'vol_ratio': None}
     try:
         is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_err, 0.0, 15.0)
@@ -357,7 +370,6 @@ def run_integrity_tests() -> None:
         assert is_entry is False
     except Exception as e:
         raise AssertionError(f"Failed to handle corrupted data safely: {e}")
-
     debug_log("All integrity tests passed.")
 
 if __name__ == "__main__":
@@ -395,9 +407,9 @@ if __name__ == "__main__":
         print(f" 🔬 小型株ロジック 分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
         print(f"     ┗ 危険な窓開け回避: {st['gap_down_cancels']} 回")
-        print(f" [2] タイムストップ(20日)撤退: {st['time_stops']} 回")
+        print(f" [2] タイムストップ(12日)撤退: {st['time_stops']} 回")
         print(f" [3] ハードストップ(-20% / 3.0ATR): {st['hard_stops']} 回")
-        print(f" [4] トレイリングストップ(3.5ATR): {st['trailing_stops']} 回")
+        print(f" [4] トレイリングストップ(2.5ATR): {st['trailing_stops']} 回")
         print(f" [5] クライマックス売り(過熱極致): {st['climax_exits']} 回")
         print(f"==================================================", flush=True)
         
