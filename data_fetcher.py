@@ -14,11 +14,10 @@ from datetime import datetime, timedelta
 
 BASE_URL: Final[str] = "https://api.jquants.com/v2"
 PRICES_ENDPOINT: Final[str] = "/equities/bars/daily"
-FINS_ENDPOINT: Final[str] = "/fins/summary"
 INFO_ENDPOINT: Final[str] = "/equities/master" 
 
 class JQuantsV2Fetcher:
-    """J-Quants API v2準拠のキャッシュ対応・小型株データ取得クラス"""
+    """J-Quants API v2準拠のキャッシュ対応・高流動性小型株データ取得クラス"""
     def __init__(self, api_key: str) -> None:
         if not isinstance(api_key, str):
             raise TypeError("API key must be a string")
@@ -30,8 +29,8 @@ class JQuantsV2Fetcher:
         safe_date = datetime.now() - timedelta(days=365 * 10 - 1)
         return safe_date.strftime("%Y-%m-%d")
 
-    def get_top_small_cap_tickers(self, limit: int = 300, max_market_cap: float = 50_000_000_000.0) -> List[str]:
-        """売買代金上位銘柄の中から、小型株（500億未満）を効率的に抽出"""
+    def get_top_small_cap_tickers(self, limit: int = 300) -> List[str]:
+        """不安定な財務APIを排除し、グロース/スタンダード市場の流動性トップ銘柄を堅牢に抽出"""
         print("[INFO] Step 1: Fetching master listed info to filter candidates...", flush=True)
         candidate_codes = None
         
@@ -42,31 +41,23 @@ class JQuantsV2Fetcher:
                 if info_data:
                     info_df = pd.DataFrame(info_data)
                     
-                    # 最優先で「名前（Nm/Name）」が入るカラムを指定検索する
                     market_col = next((c for c in ["MarketCodeName", "MktNm", "Section", "Segment"] if c in info_df.columns), None)
                     sector_col = next((c for c in ["SectorName", "S33Nm", "S17Nm"] if c in info_df.columns), None)
                     code_col = next((c for c in ["Code", "code"] if c in info_df.columns), "Code")
                     
                     if market_col and code_col in info_df.columns:
-                        sample_mkt = info_df[market_col].dropna().unique()[:5]
-                        print(f"[DEBUG] Using '{market_col}' for Market Filter. Sample values: {sample_mkt}", flush=True)
-                        
                         small_cap_segments = ["Growth", "Standard", "グロース", "スタンダード", "G", "S"]
                         candidates_info = info_df[info_df[market_col].astype(str).str.contains("|".join(small_cap_segments), na=False, case=False)]
                         
                         if sector_col:
-                            sample_sec = info_df[sector_col].dropna().unique()[:3]
-                            print(f"[DEBUG] Using '{sector_col}' for Sector Filter. Sample values: {sample_sec}", flush=True)
                             candidates_info = candidates_info[~candidates_info[sector_col].astype(str).str.contains("ETF|ETN|REIT", na=False, case=False)]
                             
                         extracted_codes = set(candidates_info[code_col].astype(str).tolist())
-                        
-                        # 安全装置: 0件になった場合はフィルター失敗とみなし、全件スキャンを許可する
-                        if len(extracted_codes) == 0:
-                            print("[WARN] Filtering resulted in 0 tickers. Ignoring filter to prevent total failure.", flush=True)
-                        else:
+                        if len(extracted_codes) > 0:
                             candidate_codes = extracted_codes
                             print(f"[INFO] Candidates filtered: {len(candidate_codes)} tickers from Growth/Standard segments.", flush=True)
+                        else:
+                            print("[WARN] Filtering resulted in 0 tickers. Proceeding without pre-filtering.", flush=True)
                     else:
                         print(f"[WARN] Valid Market column not found. Available cols: {info_df.columns.tolist()}", flush=True)
             else:
@@ -108,78 +99,30 @@ class JQuantsV2Fetcher:
         df_quotes = df_quotes.sort_values("Va_n", ascending=False)
 
         target_tickers: List[str] = []
-        scan_limit = 1000
-        processed_count = 0
         
-        print(f"[INFO] Step 3: Verifying Market Cap for top {scan_limit} turnover candidates...", flush=True)
+        # 3. 財務API（時価総額チェック）を撤廃し、売買代金トップの小型株をダイレクト抽出
+        print(f"[INFO] Step 3: Selecting top {limit} highly liquid candidates from Growth/Standard...", flush=True)
         for _, row in df_quotes.iterrows():
             code = str(row[code_col_q])
             if not code or code == "nan":
                 continue
             
-            # 事前フィルターが有効な場合のみチェック
+            # 4桁と5桁の不一致を吸収
             if candidate_codes is not None:
                 if code not in candidate_codes and code[:4] not in candidate_codes:
                     continue
-            
-            processed_count += 1
-            if processed_count > scan_limit:
-                break
 
             ticker_base = code[:4]
-            # キャッシュ機能
-            if os.path.exists(f"Colog_github/{ticker_base}.parquet"):
-                if ticker_base not in target_tickers:
-                    target_tickers.append(ticker_base)
-                    print(f"  [{len(target_tickers)}/{limit}] Cached Small Cap Loaded: {ticker_base}", flush=True)
-                if len(target_tickers) >= limit:
-                    break
-                continue
-
             close_p = float(row["C_n"])
             if close_p <= 0 or pd.isna(close_p): 
                 continue
 
-            # 財務情報を取得して時価総額を確認 (確実に5桁コードにする)
-            query_code = f"{ticker_base}0"
-            try:
-                f_resp = requests.get(f"{BASE_URL}{FINS_ENDPOINT}", headers=self.headers, params={"code": query_code}, timeout=10)
-                if f_resp.status_code == 429:
-                    print("[WARN] Rate limit hit. Sleeping 10s...", flush=True)
-                    time.sleep(10)
-                    f_resp = requests.get(f"{BASE_URL}{FINS_ENDPOINT}", headers=self.headers, params={"code": query_code}, timeout=10)
-
-                if f_resp.status_code == 200:
-                    f_data = f_resp.json().get("data", [])
-                    if f_data:
-                        latest = f_data[-1]
-                        shares = 0.0
-                        
-                        # V2キー名揺れ対応（EPS等を除外し、株式数を動的に探索）
-                        for k, v in latest.items():
-                            if v is None or str(v).strip() == "": continue
-                            k_lower = str(k).lower()
-                            if "share" in k_lower or "outstanding" in k_lower or "発行済" in str(k):
-                                if "per" not in k_lower and "eps" not in k_lower and "dividend" not in k_lower:
-                                    try:
-                                        val = float(v)
-                                        if val > 100000: # 発行済株式数は通常10万以上
-                                            shares = val
-                                            break
-                                    except ValueError: 
-                                        pass
-                        
-                        if shares > 0:
-                            mkt_cap = close_p * shares
-                            if 0 < mkt_cap < max_market_cap:
-                                target_tickers.append(ticker_base)
-                                print(f"  [{len(target_tickers)}/{limit}] Found: {ticker_base} | Cap: {mkt_cap/1e8:.1f}億 | Va: {row['Va_n']/1e6:.1f}M", flush=True)
-                                if len(target_tickers) >= limit:
-                                    break
-            except Exception as e:
-                pass
-            
-            time.sleep(0.3)
+            if ticker_base not in target_tickers:
+                target_tickers.append(ticker_base)
+                print(f"  [{len(target_tickers)}/{limit}] Selected: {ticker_base} | Va (Turnover): {row['Va_n']/1e6:.1f}M JPY", flush=True)
+                
+            if len(target_tickers) >= limit:
+                break
 
         return target_tickers
 
@@ -301,11 +244,11 @@ if __name__ == "__main__":
     fetcher = JQuantsV2Fetcher(key)
     os.makedirs("Colog_github", exist_ok=True)
     
-    target_tickers = fetcher.get_top_small_cap_tickers(limit=300, max_market_cap=50_000_000_000.0)
+    target_tickers = fetcher.get_top_small_cap_tickers(limit=300)
     if "13060" not in target_tickers and "1306" not in target_tickers:
         target_tickers.append("13060") # TOPIX ETF (ベンチマーク用)
         
-    print(f"[INFO] Starting data fetch for {len(target_tickers)} tickers...", flush=True)
+    print(f"\n[INFO] Starting data fetch for {len(target_tickers)} tickers...", flush=True)
     
     for i, target_ticker in enumerate(target_tickers):
         path = f"Colog_github/{target_ticker}.parquet"
