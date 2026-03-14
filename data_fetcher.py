@@ -9,13 +9,15 @@ from datetime import datetime, timedelta
 # 2025-2026年 最新公式ドキュメント準拠
 # Pandas: https://pandas.pydata.org/docs/
 # Requests: https://requests.readthedocs.io/en/latest/
+# J-Quants API Reference: https://jpx.gitbook.io/j-quants-ja/api-reference
 # ==========================================
 
 BASE_URL: Final[str] = "https://api.jquants.com/v2"
-ENDPOINT: Final[str] = "/equities/bars/daily"
+PRICES_ENDPOINT: Final[str] = "/prices/daily_quotes"
+FINS_ENDPOINT: Final[str] = "/fins/statements"
 
 class JQuantsV2Fetcher:
-    """J-Quants API v2準拠のデータ取得クラス"""
+    """J-Quants API v2準拠のデータ取得クラス（小型株対応）"""
     def __init__(self, api_key: str) -> None:
         if not isinstance(api_key, str):
             raise TypeError("API key must be a string")
@@ -27,32 +29,76 @@ class JQuantsV2Fetcher:
         safe_date = datetime.now() - timedelta(days=365 * 10 - 1)
         return safe_date.strftime("%Y-%m-%d")
 
-    def get_top_tickers(self, limit: int = 300) -> List[str]:
-        """直近の売買代金上位銘柄を抽出する"""
+    def get_top_small_cap_tickers(self, limit: int = 300, max_market_cap: float = 50_000_000_000.0) -> List[str]:
+        """売買代金上位銘柄の中から、時価総額が基準未満の小型株を抽出する"""
         if not isinstance(limit, int) or limit <= 0:
             raise ValueError("limit must be a positive integer")
+        if not isinstance(max_market_cap, float) or max_market_cap <= 0:
+            raise ValueError("max_market_cap must be a positive float")
             
-        print("[INFO] Fetching top tickers by TurnoverValue...")
+        print("[INFO] Fetching daily quotes to sort by TurnoverValue...")
         target_date = datetime.now().date()
+        daily_quotes = []
         
-        for _ in range(5):
+        # 1. 直近の有効な取引日の全銘柄株価を取得
+        for _ in range(10):
             params = {"date": target_date.strftime("%Y%m%d")}
             try:
-                response = requests.get(f"{BASE_URL}{ENDPOINT}", headers=self.headers, params=params, timeout=30)
+                response = requests.get(f"{BASE_URL}{PRICES_ENDPOINT}", headers=self.headers, params=params, timeout=30)
                 if response.status_code == 200:
-                    data = response.json().get("data", [])
+                    data = response.json().get("daily_quotes", [])
                     if len(data) > 500:
-                        df = pd.DataFrame(data)
-                        df['Va_n'] = pd.to_numeric(df.get('TurnoverValue', df.get('Va', 0)), errors='coerce')
-                        top_df = df[df['Va_n'] >= 50_000_000].sort_values('Va_n', ascending=False).head(limit)
-                        return [str(code)[:4] for code in top_df['Code'].tolist()]
+                        daily_quotes = data
+                        break
             except Exception as e:
                 print(f"[WARN] Failed to fetch daily data for {target_date}: {e}")
             target_date -= timedelta(days=1)
             time.sleep(1)
             
-        print("[ERROR] Could not fetch recent market data.")
-        return []
+        if not daily_quotes:
+            print("[ERROR] Could not fetch recent market data.")
+            return []
+
+        # 2. 売買代金で降順ソート
+        df = pd.DataFrame(daily_quotes)
+        df['TurnoverValue'] = pd.to_numeric(df.get('TurnoverValue', 0), errors='coerce')
+        df['Close'] = pd.to_numeric(df.get('Close', 0), errors='coerce')
+        df = df.sort_values('TurnoverValue', ascending=False)
+        
+        target_tickers: List[str] = []
+        print(f"[INFO] Scanning for small caps (Market Cap < {max_market_cap/1_000_000_000:.1f}B JPY)...")
+        
+        # 3. 上位から順に時価総額を計算し、小型株を抽出
+        for _, row in df.iterrows():
+            code = str(row['Code'])
+            close_price = float(row['Close'])
+            if close_price <= 0: 
+                continue
+                
+            f_params = {"code": code}
+            try:
+                f_resp = requests.get(f"{BASE_URL}{FINS_ENDPOINT}", headers=self.headers, params=f_params, timeout=10)
+                if f_resp.status_code == 200:
+                    f_data = f_resp.json().get("statements", [])
+                    if f_data:
+                        # 最新の財務諸表から期末発行済株式数を取得
+                        latest_statement = f_data[-1]
+                        shares_str = latest_statement.get("NumberOfIssuedAndOutstandingSharesAtTheEndOfPeriod", "0")
+                        shares = float(shares_str) if shares_str and str(shares_str).strip() != "" else 0.0
+                        
+                        market_cap = close_price * shares
+                        
+                        if 0 < market_cap < max_market_cap:
+                            target_tickers.append(code[:4])
+                            print(f"  [+] Small Cap Found: {code[:4]} (Market Cap: {market_cap/1_000_000_000:.1f}B JPY)")
+                            if len(target_tickers) >= limit:
+                                break
+            except Exception as e:
+                print(f"[WARN] Failed to fetch financials for {code}: {e}")
+                
+            time.sleep(0.2) # APIのレートリミット保護
+            
+        return target_tickers
 
     def fetch(self, ticker: str) -> pd.DataFrame:
         if not isinstance(ticker, str):
@@ -69,7 +115,7 @@ class JQuantsV2Fetcher:
                 params["pagination_key"] = pagination_key
 
             try:
-                response = requests.get(f"{BASE_URL}{ENDPOINT}", headers=self.headers, params=params, timeout=30)
+                response = requests.get(f"{BASE_URL}{PRICES_ENDPOINT}", headers=self.headers, params=params, timeout=30)
             except requests.exceptions.RequestException as e:
                 print(f"[ERROR] Network error during fetch: {e}")
                 return pd.DataFrame()
@@ -79,7 +125,7 @@ class JQuantsV2Fetcher:
                 return pd.DataFrame()
 
             res_json = response.json()
-            all_data.extend(res_json.get("data", []))
+            all_data.extend(res_json.get("daily_quotes", []))
 
             pagination_key = res_json.get("pagination_key")
             if not pagination_key:
@@ -96,11 +142,11 @@ class JQuantsV2Fetcher:
             
         col_map = {
             'Date': 'date', 
-            'AdjClose': 'close', 'AdjC': 'close', 'C': 'close_raw', 'Close': 'close_raw',
-            'AdjHigh': 'high', 'AdjH': 'high', 'H': 'high_raw', 'High': 'high_raw',
-            'AdjLow': 'low', 'AdjL': 'low', 'L': 'low_raw', 'Low': 'low_raw',
-            'AdjOpen': 'open', 'AdjO': 'open', 'O': 'open_raw', 'Open': 'open_raw',
-            'AdjVolume': 'volume', 'AdjVo': 'volume', 'Vo': 'volume_raw', 'Volume': 'volume_raw',
+            'AdjustmentClose': 'close', 'AdjC': 'close', 'Close': 'close_raw',
+            'AdjustmentHigh': 'high', 'AdjH': 'high', 'High': 'high_raw',
+            'AdjustmentLow': 'low', 'AdjL': 'low', 'Low': 'low_raw',
+            'AdjustmentOpen': 'open', 'AdjO': 'open', 'Open': 'open_raw',
+            'AdjustmentVolume': 'volume', 'AdjVo': 'volume', 'Volume': 'volume_raw',
             'TurnoverValue': 'turnover', 'Va': 'turnover'
         }
         df = df.rename(columns=col_map)
@@ -119,7 +165,6 @@ class JQuantsV2Fetcher:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        # 売買代金が存在しない場合は 終値×出来高 で疑似算出（小型株判定のため必須）
         if 'turnover' not in df.columns or df['turnover'].isnull().all():
             df['turnover'] = df['close'] * df['volume']
                 
@@ -135,14 +180,14 @@ def test_integrity() -> None:
     print("[TEST] Running integrity tests for data_fetcher.py...")
     dummy_fetcher = JQuantsV2Fetcher("dummy_key")
     
-    df_mock_adj = pd.DataFrame({
-        'Date': ['2026-01-01'], 'AdjC': [150.5], 'AdjH': [155.0], 
-        'AdjL': [149.0], 'AdjO': [150.0], 'AdjVo': [5000], 'TurnoverValue': [752500]
+    df_mock = pd.DataFrame({
+        'Date': ['2026-01-01'], 'AdjustmentClose': [150.5], 'AdjustmentHigh': [155.0], 
+        'AdjustmentLow': [149.0], 'AdjustmentOpen': [150.0], 'AdjustmentVolume': [5000], 'TurnoverValue': [752500]
     })
-    cleaned_adj = dummy_fetcher._clean(df_mock_adj)
-    assert 'close' in cleaned_adj.columns, "AdjC should be mapped to 'close'"
-    assert 'turnover' in cleaned_adj.columns, "TurnoverValue should be mapped to 'turnover'"
-    assert cleaned_adj['close'].iloc[0] == 150.5, "Value matching failed for AdjC"
+    cleaned_df = dummy_fetcher._clean(df_mock)
+    assert 'close' in cleaned_df.columns, "AdjustmentClose should be mapped to 'close'"
+    assert 'turnover' in cleaned_df.columns, "TurnoverValue should be mapped to 'turnover'"
+    assert cleaned_df['close'].iloc[0] == 150.5, "Value matching failed for close"
 
     df_empty = pd.DataFrame()
     cleaned_empty = dummy_fetcher._clean(df_empty)
@@ -165,11 +210,12 @@ if __name__ == "__main__":
         exit(0)
         
     fetcher = JQuantsV2Fetcher(key)
-    os.makedirs("data", exist_ok=True)
+    os.makedirs("Colog_github", exist_ok=True)
     
-    target_tickers = fetcher.get_top_tickers(limit=300)
+    # 時価総額500億円未満、売買代金上位300銘柄を取得
+    target_tickers = fetcher.get_top_small_cap_tickers(limit=300, max_market_cap=50_000_000_000.0)
     if "13060" not in target_tickers:
-        target_tickers.append("13060")
+        target_tickers.append("13060") # TOPIX ETF (ベンチマーク用)
         
     print(f"[INFO] Starting data fetch for {len(target_tickers)} tickers...")
     
@@ -177,7 +223,7 @@ if __name__ == "__main__":
         print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}...", end=" ")
         fetched_data = fetcher.fetch(target_ticker)
         if not fetched_data.empty:
-            fetched_data.to_parquet(f"data/{target_ticker}.parquet", index=False)
+            fetched_data.to_parquet(f"Colog_github/{target_ticker}.parquet", index=False)
             print(f"OK ({len(fetched_data)} rows)")
         else:
             print("FAILED")
