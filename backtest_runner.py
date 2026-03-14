@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 # Pandas: https://pandas.pydata.org/docs/
 # yfinance: https://yfinance.readthedocs.io/en/latest/
 # J-Quants API v2: https://jpx-jquants.com/api/
-# GitHub Actions ENV: https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions
 # ==========================================
 
 def debug_log(msg: str) -> None:
@@ -22,27 +21,28 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. J-Quants API v2 クライアント (APIキー方式)
+# 1. J-Quants API v2 クライアント (リフレッシュトークン方式修正版)
 # ==========================================
 class JQuantsV2Client:
     """JPX公式 J-Quants API v2 クライアント"""
     def __init__(self, api_key: str):
         if not isinstance(api_key, str): raise TypeError("api_key must be string")
-        if not api_key: raise ValueError("API Key is required")
+        if not api_key: raise ValueError("API Key (Refresh Token) is required")
         self.api_key: str = api_key
         self.id_token: str = ""
         self.base_url: str = "https://api.jquants.com/v1" 
         self._refresh_id_token()
 
     def _refresh_id_token(self) -> None:
-        """APIキーを使用してIDトークンを取得・更新する"""
-        url = f"{self.base_url}/token/auth_user"
+        """リフレッシュトークンを使用してIDトークンを取得・更新する"""
+        # 修正: auth_refreshエンドポイントにクエリパラメータとしてトークンを渡す
+        url = f"{self.base_url}/token/auth_refresh?refreshtoken={self.api_key}"
         try:
-            res = requests.post(url, json={"apiKey": self.api_key}, timeout=15)
+            res = requests.post(url, timeout=15)
             res.raise_for_status()
             self.id_token = res.json().get("idToken", "")
             if self.id_token:
-                debug_log("Successfully authenticated with J-Quants v2 API Key.")
+                debug_log("Successfully authenticated with J-Quants API.")
             else:
                 debug_log("Warning: Authentication succeeded but idToken is empty.")
         except Exception as e:
@@ -56,25 +56,32 @@ class JQuantsV2Client:
             self._refresh_id_token()
             if not self.id_token: return {}
         
-        url = f"{self.base_url}/statements/basic?code={ticker}"
+        # 修正: 財務情報の公式エンドポイントは /fins/statements
+        url = f"{self.base_url}/fins/statements?code={ticker}"
         headers = {"Authorization": f"Bearer {self.id_token}"}
         
         try:
             res = requests.get(url, headers=headers, timeout=15)
-            if res.status_code == 401: # トークン切れ
+            if res.status_code == 401: # トークン切れの自動再試行
                 self._refresh_id_token()
                 headers["Authorization"] = f"Bearer {self.id_token}"
                 res = requests.get(url, headers=headers, timeout=15)
             
             res.raise_for_status()
             data = res.json().get("statements", [])
-            return data[0] if data else {}
+            if not data:
+                return {}
+            
+            # 複数ある場合は DisclosedDate でソートして最新（配列の最後）を取得
+            data.sort(key=lambda x: x.get("DisclosedDate", ""))
+            return data[-1]
+            
         except Exception as e:
-            debug_log(f"J-Quants v2 API Error for {ticker}: {e}")
+            debug_log(f"J-Quants API Error for {ticker}: {e}")
             return {}
 
 # ==========================================
-# ファンダメンタルズ・キャッシュマネージャー
+# ファンダメンタルズ・キャッシュマネージャー（J-Quants統合・自動修復版）
 # ==========================================
 class FundamentalCache:
     """J-Quantsからの情報取得負荷を下げるためのローカルキャッシュ"""
@@ -98,6 +105,7 @@ class FundamentalCache:
     def get_fundamentals(self, ticker: str) -> Dict[str, float]:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
+        # 【自動修復ロジック】キャッシュが存在しない、または前回エラー時の 0.0 データの場合は再取得
         needs_fetch = False
         if ticker not in self.data:
             needs_fetch = True
@@ -109,15 +117,20 @@ class FundamentalCache:
             try:
                 stmt = self.jq_client.get_statements(ticker)
                 
-                equity_raw = stmt.get("Equity", 0.0)
-                assets_raw = stmt.get("TotalAssets", 0.0)
-                income_raw = stmt.get("NetIncome", 0.0)
+                # 修正: J-Quantsのキーに合わせて取得 (Profit: 純利益, Equity: 自己資本, TotalAssets: 総資産)
+                equity_raw = stmt.get("Equity")
+                assets_raw = stmt.get("TotalAssets")
+                income_raw = stmt.get("Profit")
                 
-                equity = float(equity_raw) if equity_raw is not None else 0.0
-                total_assets = float(assets_raw) if assets_raw is not None else 0.0
-                net_income = float(income_raw) if income_raw is not None else 0.0
+                # Noneや空文字に対する堅牢なパース
+                equity = float(equity_raw) if equity_raw else 0.0
+                total_assets = float(assets_raw) if assets_raw else 0.0
+                net_income = float(income_raw) if income_raw else 0.0
                 
+                # 自己資本比率 (%) = 自己資本 / 総資産 * 100
                 equity_ratio = (equity / total_assets * 100.0) if total_assets > 0 else 0.0
+                
+                # ROE (%) = 当期純利益 / 自己資本 * 100
                 roe = (net_income / equity * 100.0) if equity > 0 else 0.0
                 
                 self.data[ticker] = {'roe': roe, 'equity_ratio': equity_ratio}
@@ -125,6 +138,7 @@ class FundamentalCache:
                 debug_log(f"Error calculating fundamental for {ticker}: {e}")
                 self.data[ticker] = {'roe': 0.0, 'equity_ratio': 0.0} 
             
+            # API制限・消失回避のため、1件ごとに保存
             try:
                 with open(self.filepath, 'w', encoding='utf-8') as f:
                     json.dump(self.data, f, ensure_ascii=False, indent=2)
@@ -161,6 +175,7 @@ class SmallCapStrategyAnalyzer:
 
         df['prev_close'] = df['close'].shift(1)
         
+        # 過去指標の完全継承
         df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma25'] = df['close'].rolling(window=25).mean()
         df['ma50'] = df['close'].rolling(window=50).mean()
