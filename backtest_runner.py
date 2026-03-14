@@ -2,29 +2,88 @@ import pandas as pd
 import numpy as np
 import os
 import json
+import requests
 import yfinance as yf
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Union
 from datetime import datetime, timedelta
 
 # ==========================================
 # 2025-2026年 最新公式ドキュメント準拠
 # Pandas: https://pandas.pydata.org/docs/
 # yfinance: https://yfinance.readthedocs.io/en/latest/
+# J-Quants API v2: https://jpx-jquants.com/api/
 # ==========================================
 
 def debug_log(msg: str) -> None:
-    """内部デバッグ用のロギング関数"""
-    if not isinstance(msg, str): raise TypeError("msg must be a string")
+    """内部デバッグ用のロギング関数。引数の型チェックを含む。"""
+    if not isinstance(msg, str): 
+        msg = str(msg)
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# ファンダメンタルズ・キャッシュマネージャー（自動修復版）
+# 1. J-Quants API v2 クライアント (APIキー方式)
+# ==========================================
+class JQuantsV2Client:
+    """JPX公式 J-Quants API v2 クライアント"""
+    def __init__(self, api_key: str):
+        if not isinstance(api_key, str): raise TypeError("api_key must be string")
+        if not api_key: raise ValueError("API Key is required")
+        self.api_key: str = api_key
+        self.id_token: str = ""
+        self.base_url: str = "https://api.jquants.com/v1" 
+        self._refresh_id_token()
+
+    def _refresh_id_token(self) -> None:
+        """APIキーを使用してIDトークンを取得・更新する"""
+        url = f"{self.base_url}/token/auth_user"
+        try:
+            res = requests.post(url, json={"apiKey": self.api_key}, timeout=15)
+            res.raise_for_status()
+            self.id_token = res.json().get("idToken", "")
+            if self.id_token:
+                debug_log("Successfully authenticated with J-Quants v2 API Key.")
+            else:
+                debug_log("Warning: Authentication succeeded but idToken is empty.")
+        except Exception as e:
+            debug_log(f"Failed J-Quants v2 Auth: {e}")
+            self.id_token = ""
+
+    def get_statements(self, ticker: str) -> Dict[str, Any]:
+        """最新の財務諸表（短信）を取得する"""
+        if not isinstance(ticker, str): raise TypeError("ticker must be string")
+        if not self.id_token: 
+            self._refresh_id_token()
+            if not self.id_token: return {}
+        
+        # J-Quantsは4桁の銘柄コードを想定
+        url = f"{self.base_url}/statements/basic?code={ticker}"
+        headers = {"Authorization": f"Bearer {self.id_token}"}
+        
+        try:
+            res = requests.get(url, headers=headers, timeout=15)
+            if res.status_code == 401: # トークン切れの自動再試行
+                self._refresh_id_token()
+                headers["Authorization"] = f"Bearer {self.id_token}"
+                res = requests.get(url, headers=headers, timeout=15)
+            
+            res.raise_for_status()
+            data = res.json().get("statements", [])
+            return data[0] if data else {}
+        except Exception as e:
+            debug_log(f"J-Quants v2 API Error for {ticker}: {e}")
+            return {}
+
+# ==========================================
+# ファンダメンタルズ・キャッシュマネージャー（J-Quants統合・自動修復版）
 # ==========================================
 class FundamentalCache:
-    """yfinanceからの情報取得負荷を下げるためのローカルキャッシュ"""
-    def __init__(self, data_dir: str):
+    """J-Quantsからの情報取得負荷を下げるためのローカルキャッシュ"""
+    def __init__(self, data_dir: str, api_key: str):
         if not isinstance(data_dir, str): raise TypeError("data_dir must be string")
+        if not isinstance(api_key, str): raise TypeError("api_key must be string")
+        
         self.filepath = os.path.join(data_dir, "fundamentals_cache.json")
+        self.jq_client = JQuantsV2Client(api_key)
         self.data: Dict[str, Dict[str, float]] = self._load()
 
     def _load(self) -> Dict[str, Dict[str, float]]:
@@ -47,27 +106,31 @@ class FundamentalCache:
             needs_fetch = True
             
         if needs_fetch:
-            debug_log(f"Fetching fundamentals for {ticker}...")
+            debug_log(f"Fetching fundamentals for {ticker} from J-Quants...")
             try:
-                # 日本株の場合は末尾に '.T' を付与して yfinance に問い合わせる
-                yf_ticker = f"{ticker}.T" if ticker.isdigit() else ticker
-                info = yf.Ticker(yf_ticker).info
+                stmt = self.jq_client.get_statements(ticker)
                 
-                # ROEの取得 (Noneの場合は0とする)
-                roe_raw = info.get('returnOnEquity', 0.0)
-                roe = float(roe_raw) * 100 if roe_raw is not None else 0.0
+                # J-Quantsのキー名から数値を取得 (Noneや空文字を考慮)
+                equity_raw = stmt.get("Equity", 0.0)
+                assets_raw = stmt.get("TotalAssets", 0.0)
+                income_raw = stmt.get("NetIncome", 0.0)
                 
-                # 自己資本比率の計算 (Debt to Equityから逆算)
-                dte_raw = info.get('debtToEquity', 0.0)
-                dte = float(dte_raw) if dte_raw is not None else 0.0
-                equity_ratio = 100.0 / (1.0 + (dte / 100.0))
+                equity = float(equity_raw) if equity_raw is not None else 0.0
+                total_assets = float(assets_raw) if assets_raw is not None else 0.0
+                net_income = float(income_raw) if income_raw is not None else 0.0
+                
+                # 自己資本比率 (%) = 自己資本 / 総資産 * 100
+                equity_ratio = (equity / total_assets * 100.0) if total_assets > 0 else 0.0
+                
+                # ROE (%) = 当期純利益 / 自己資本 * 100
+                roe = (net_income / equity * 100.0) if equity > 0 else 0.0
                 
                 self.data[ticker] = {'roe': roe, 'equity_ratio': equity_ratio}
             except Exception as e:
-                debug_log(f"Error fetching fundamental for {ticker}: {e}")
+                debug_log(f"Error calculating fundamental for {ticker}: {e}")
                 self.data[ticker] = {'roe': 0.0, 'equity_ratio': 0.0} 
             
-            # API制限回避のため、1件ごとに保存
+            # API制限・消失回避のため、1件ごとに保存
             try:
                 with open(self.filepath, 'w', encoding='utf-8') as f:
                     json.dump(self.data, f, ensure_ascii=False, indent=2)
@@ -234,13 +297,15 @@ class USMarketCache:
         return 0.0, 15.0
 
 class SmallCapPortfolioBacktester:
-    def __init__(self, data_dir: str, initial_cash: float = 1000000.0, max_positions: int = 5) -> None:
+    def __init__(self, data_dir: str, api_key: str, initial_cash: float = 1000000.0, max_positions: int = 5) -> None:
         if not isinstance(data_dir, str): raise TypeError("data_dir must be string")
+        if not isinstance(api_key, str): raise TypeError("api_key must be string")
+        
         self.cash: float = initial_cash
         self.initial_cash: float = initial_cash
         self.max_positions: int = max_positions
         self.us_market = USMarketCache()
-        self.fund_cache = FundamentalCache(data_dir)
+        self.fund_cache = FundamentalCache(data_dir, api_key)
         
         self.stats = {
             'orders_placed': 0, 'orders_exec': 0,
@@ -263,7 +328,7 @@ class SmallCapPortfolioBacktester:
             df = SmallCapStrategyAnalyzer.calculate_indicators(df, bm_df)
             if df.empty: continue
             
-            # キャッシュからファンダを取得（不良データの場合は.T付与で再取得・保存される）
+            # キャッシュからファンダを取得（不良データの場合はJ-Quantsで再取得・保存される）
             self.fund_cache.get_fundamentals(ticker)
             
             df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
@@ -470,7 +535,16 @@ def run_integrity_tests() -> None:
     debug_log("All integrity tests passed.")
 
 if __name__ == "__main__":
+    # 【必須】J-Quants v2 APIキーをここにセットしてください
+    JQ_API_KEY = "YOUR_JQUANTS_V2_API_KEY"
+    
     run_integrity_tests()
+    
+    if JQ_API_KEY == "YOUR_JQUANTS_V2_API_KEY":
+        print("\n[ERROR] J-Quants v2 APIキーがセットされていません。")
+        print("マイページから発行されたAPIキーを JQ_API_KEY に入力して再試行してください。")
+        exit(1)
+        
     try:
         data_dir = "Colog_github"
         if not os.path.exists(data_dir):
@@ -484,7 +558,7 @@ if __name__ == "__main__":
         STARTING_CAPITAL = 1000000.0
         MAX_CONCURRENT_POSITIONS = 5
         
-        tester = SmallCapPortfolioBacktester(data_dir=data_dir, initial_cash=STARTING_CAPITAL, max_positions=MAX_CONCURRENT_POSITIONS)
+        tester = SmallCapPortfolioBacktester(data_dir=data_dir, api_key=JQ_API_KEY, initial_cash=STARTING_CAPITAL, max_positions=MAX_CONCURRENT_POSITIONS)
         res = tester.run()
         
         print(f"\n==================================================")
