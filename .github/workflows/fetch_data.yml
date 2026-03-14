@@ -23,7 +23,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip' # キャッシュを有効化して高速化
+          # cache: 'pip' を削除し、requirements.txt不在によるエラーを回避
         
       - name: Install dependencies
         run: |
