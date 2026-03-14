@@ -47,17 +47,15 @@ class JQuantsV2Client:
             try:
                 res = requests.get(url, headers=headers, timeout=10)
                 if res.status_code == 404:
-                    continue # 次のエンドポイントを試す
+                    continue 
                 res.raise_for_status()
                 
                 resp_json = res.json()
-                # 取得できた配列を探す (statements or data)
                 data = resp_json.get("statements") or resp_json.get("data") or []
                 
                 if not data:
                     return {}
                 
-                # 複数ある場合は DisclosedDate でソートして最新を取得
                 data.sort(key=lambda x: str(x.get("DisclosedDate", "")))
                 return data[-1]
                 
@@ -90,7 +88,7 @@ class FundamentalCache:
         return {}
 
     def _validate_and_repair_cache(self) -> None:
-        """キャッシュ内の異常値（小数保存による全滅等）を検知し強制浄化する"""
+        """キャッシュ内の異常値を検知し強制浄化する"""
         if not self.data: return
         valid_count = 0
         for d in self.data.values():
@@ -100,9 +98,8 @@ class FundamentalCache:
             except:
                 pass
                 
-        # 50銘柄以上あるのに1件も条件をクリアしない場合は、形式不整合（例: 15.0ではなく0.15になっている）と判断
         if valid_count == 0 and len(self.data) > 50:
-            debug_log("WARNING: Local cache has 0 valid companies. Format may be corrupted (e.g., decimals). Forcing cache clear...")
+            debug_log("WARNING: Local cache has 0 valid companies. Format may be corrupted. Forcing cache clear...")
             self.data = {}
             if os.path.exists(self.filepath):
                 try:
@@ -113,8 +110,18 @@ class FundamentalCache:
     def get_fundamentals(self, ticker: str) -> Dict[str, float]:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
-        # 浄化処理を経てもなおキャッシュに存在しない場合はフェッチ
+        roe_val = self.data.get(ticker, {}).get('roe', 0.0)
+        eq_val = self.data.get(ticker, {}).get('equity_ratio', 0.0)
+        
+        needs_fetch = False
         if ticker not in self.data:
+            needs_fetch = True
+        elif roe_val in [0.0, -999.0] and eq_val in [0.0, -999.0]:
+            needs_fetch = True
+        elif roe_val == -999.0 or eq_val == -999.0:
+            needs_fetch = True
+            
+        if needs_fetch:
             debug_log(f"Fetching fundamentals for {ticker}...")
             roe, equity_ratio = 0.0, 0.0
             
@@ -123,13 +130,11 @@ class FundamentalCache:
                 if not stmt:
                     raise ValueError("No data returned from J-Quants")
                 
-                # J-Quants V2 短縮名等の推測
                 assets_raw = stmt.get("TotalAssets") or stmt.get("TotAssets") or stmt.get("TotalAsset")
                 equity_raw = stmt.get("Equity") or stmt.get("NetAssets") or stmt.get("Eq")
                 income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("OperatingProfit")
                 
                 if assets_raw is None or equity_raw is None:
-                    debug_log(f"J-Quants keys received: {list(stmt.keys())}")
                     raise ValueError("Target keys missing in J-Quants response")
                     
                 equity = float(equity_raw)
@@ -140,7 +145,6 @@ class FundamentalCache:
                 roe = (net_income / equity * 100.0) if equity > 0 else 0.0
                 
             except Exception as e:
-                # 【究極の防衛線】J-Quantsが失敗した場合は yfinance に丸投げする
                 debug_log(f"J-Quants failed for {ticker} ({e}). Falling back to yfinance...")
                 try:
                     yf_ticker = f"{ticker}.T" if ticker.isdigit() else ticker
@@ -158,7 +162,6 @@ class FundamentalCache:
                     
             self.data[ticker] = {'roe': roe, 'equity_ratio': equity_ratio}
             
-            # API制限回避のため、1件ごとに上書き保存
             try:
                 with open(self.filepath, 'w', encoding='utf-8') as f:
                     json.dump(self.data, f, ensure_ascii=False, indent=2)
@@ -261,7 +264,9 @@ class SmallCapStrategyAnalyzer:
         if not isinstance(fund_data, dict): raise TypeError("fund_data must be a dictionary")
         
         market_healthy = bool(row_dict.get('market_healthy', True))
-        if not market_healthy or vix >= 25.0:
+        
+        # 【MDD改善1】 VIXの許容上限を25.0から22.0へ厳格化。荒れた相場でのエントリーを防ぐ
+        if not market_healthy or vix >= 22.0:
             return False, 0.0, False
             
         roe = SmallCapStrategyAnalyzer._to_float(fund_data.get('roe', 0.0))
@@ -278,11 +283,16 @@ class SmallCapStrategyAnalyzer:
         vol_ratio = SmallCapStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0))
         is_bullish = bool(row_dict.get('is_bullish', False))
         close_pos = SmallCapStrategyAnalyzer._to_float(row_dict.get('close_position', 0.0))
+        
+        # 【MDD改善2】 テクニカル指標の強化（モメンタム確認とボラティリティ排除）
+        rsi = SmallCapStrategyAnalyzer._to_float(row_dict.get('rsi', 0.0))
+        atr_pct = SmallCapStrategyAnalyzer._to_float(row_dict.get('atr_pct', 0.0))
 
         score = 0.0
         
         if curr_c > ma25_val and ma25_val > ma50_val and ma50_val > ma200_val:
-            if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70:
+            # RSI50以上で上昇圧力を担保し、ATR10%以上のノイズ（仕手株）を弾く
+            if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and rsi >= 50.0 and atr_pct < 10.0:
                 score += 100.0
                 
         is_entry = (score >= 100.0) 
@@ -349,7 +359,6 @@ class SmallCapPortfolioBacktester:
             df = SmallCapStrategyAnalyzer.calculate_indicators(df, bm_df)
             if df.empty: continue
             
-            # ここで必ずキャッシュから取得（浄化済みの場合は再フェッチされる）
             self.fund_cache.get_fundamentals(ticker)
             
             df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
@@ -364,9 +373,6 @@ class SmallCapPortfolioBacktester:
         self.sorted_dates = sorted(list(dates_set))
         debug_log(f"Timeline built. Total trading days: {len(self.sorted_dates)}")
         
-        passed_tickers = [t for t, data in self.fund_cache.data.items() if data.get('roe', 0.0) >= 10.0 and data.get('equity_ratio', 0.0) >= 50.0]
-        debug_log(f"★ Quality Filter Passed Tickers (ROE>=10%, Eq>=50%): {len(passed_tickers)} / {len(self.fund_cache.data)}")
-
     def run(self) -> Dict[str, Any]:
         cash = self.cash
         positions: Dict[str, Dict[str, Any]] = {} 
@@ -377,6 +383,9 @@ class SmallCapPortfolioBacktester:
         for date_str in self.sorted_dates:
             today_market = self.timeline[date_str]
             n_chg, vix = self.us_market.get_state(date_str)
+            
+            # 当日の総資産を計算（ポジションサイジングに使用）
+            current_total_equity = cash + sum([p['qty'] * SmallCapStrategyAnalyzer._to_float(today_market.get(t, {}).get('close', p['entry_p'])) for t, p in positions.items()])
             
             new_pending = []
             for order in pending_orders:
@@ -440,12 +449,14 @@ class SmallCapPortfolioBacktester:
                     exit_score += 100
                     self.stats['climax_exits'] += 1
 
-                trailing_stop_price = pos['high_p'] - (current_atr * 3.0)
+                # 【MDD改善3】 トレイリングストップを 3.0ATR から 2.5ATR に引き締め、利益の急激な溶けを防ぐ
+                trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                if pos['days_held'] >= 15 and curr_c < (pos['entry_p'] * 1.03) and exit_score == 0: 
+                # 【MDD改善4】 タイムストップを15日→10日に短縮し、機会損失を抑える
+                if pos['days_held'] >= 10 and curr_c < (pos['entry_p'] * 1.03) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
 
@@ -473,7 +484,11 @@ class SmallCapPortfolioBacktester:
                 allowed_slots_today = min(open_slots, self.max_positions)
                 
                 for score, ticker in candidates[:allowed_slots_today]:
-                    target_alloc = cash / open_slots 
+                    # 【MDD改善5】 リスク管理：1銘柄に投じる資金を「総資産の20%」を上限とする。
+                    # 全額突っ込むことによる、複利増加時の深刻なドローダウンを回避する。
+                    max_alloc_per_trade = current_total_equity * (1.0 / self.max_positions)
+                    target_alloc = min(cash / open_slots, max_alloc_per_trade)
+                    
                     pending_orders.append({
                         'ticker': ticker,
                         'allocated_cash': target_alloc
@@ -521,7 +536,7 @@ def run_integrity_tests() -> None:
     dummy_row_ok = {
         'close': 1050.0, 'ma25': 1000.0, 'ma50': 950.0, 'ma200': 800.0,
         'vol_ratio': 2.5, 'is_bullish': True, 'close_position': 0.8,
-        'market_healthy': True
+        'market_healthy': True, 'rsi': 55.0, 'atr_pct': 5.0
     }
     dummy_fund_ok = {'roe': 12.0, 'equity_ratio': 55.0}
     try:
@@ -592,10 +607,10 @@ if __name__ == "__main__":
         print(f" 🔬 小型株ロジック 分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
-        print(f" [3] タイムストップ(15日)撤退: {st['time_stops']} 回")
+        print(f" [3] タイムストップ(10日)撤退: {st['time_stops']} 回")
         print(f" [4] 建値ストップ(負け回避): {st['breakeven_stops']} 回")
         print(f" [5] ハードストップ(安値割れ): {st['hard_stops']} 回")
-        print(f" [6] トレイリングストップ(3.0ATR): {st['trailing_stops']} 回")
+        print(f" [6] トレイリングストップ(2.5ATR): {st['trailing_stops']} 回")
         print(f" [7] クライマックス売り(過熱極致): {st['climax_exits']} 回")
         print(f"==================================================", flush=True)
         
