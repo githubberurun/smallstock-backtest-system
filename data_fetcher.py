@@ -42,20 +42,33 @@ class JQuantsV2Fetcher:
                 if info_data:
                     info_df = pd.DataFrame(info_data)
                     
-                    # 判明した最新のV2カラム名（MktNm, S33Nmなど）を網羅した動的探索
-                    market_col = next((c for c in info_df.columns if str(c).lower() in ["marketcodename", "marketcode", "market_code", "section", "segment", "mktnm", "mkt"]), None)
-                    sector_col = next((c for c in info_df.columns if str(c).lower() in ["sectorname", "sectorcode", "sector_name", "sector", "s33nm", "s33", "s17nm", "s17"]), None)
-                    code_col = next((c for c in info_df.columns if str(c).lower() in ["code", "symbol"]), "Code")
+                    # 最優先で「名前（Nm/Name）」が入るカラムを指定検索する
+                    market_col = next((c for c in ["MarketCodeName", "MktNm", "Section", "Segment"] if c in info_df.columns), None)
+                    sector_col = next((c for c in ["SectorName", "S33Nm", "S17Nm"] if c in info_df.columns), None)
+                    code_col = next((c for c in ["Code", "code"] if c in info_df.columns), "Code")
                     
                     if market_col and code_col in info_df.columns:
+                        sample_mkt = info_df[market_col].dropna().unique()[:5]
+                        print(f"[DEBUG] Using '{market_col}' for Market Filter. Sample values: {sample_mkt}", flush=True)
+                        
                         small_cap_segments = ["Growth", "Standard", "グロース", "スタンダード", "G", "S"]
-                        candidates_info = info_df[info_df[market_col].astype(str).str.contains("|".join(small_cap_segments), na=True)]
+                        candidates_info = info_df[info_df[market_col].astype(str).str.contains("|".join(small_cap_segments), na=False, case=False)]
+                        
                         if sector_col:
-                            candidates_info = candidates_info[~candidates_info[sector_col].astype(str).str.contains("ETF|ETN|REIT", na=False)]
-                        candidate_codes = set(candidates_info[code_col].astype(str).tolist())
-                        print(f"[INFO] Candidates filtered: {len(candidate_codes)} tickers from Growth/Standard segments.", flush=True)
+                            sample_sec = info_df[sector_col].dropna().unique()[:3]
+                            print(f"[DEBUG] Using '{sector_col}' for Sector Filter. Sample values: {sample_sec}", flush=True)
+                            candidates_info = candidates_info[~candidates_info[sector_col].astype(str).str.contains("ETF|ETN|REIT", na=False, case=False)]
+                            
+                        extracted_codes = set(candidates_info[code_col].astype(str).tolist())
+                        
+                        # 安全装置: 0件になった場合はフィルター失敗とみなし、全件スキャンを許可する
+                        if len(extracted_codes) == 0:
+                            print("[WARN] Filtering resulted in 0 tickers. Ignoring filter to prevent total failure.", flush=True)
+                        else:
+                            candidate_codes = extracted_codes
+                            print(f"[INFO] Candidates filtered: {len(candidate_codes)} tickers from Growth/Standard segments.", flush=True)
                     else:
-                        print(f"[WARN] Market column not found. Available cols: {info_df.columns.tolist()}", flush=True)
+                        print(f"[WARN] Valid Market column not found. Available cols: {info_df.columns.tolist()}", flush=True)
             else:
                 print(f"[WARN] Master info fetch failed ({info_resp.status_code}). Proceeding without pre-filtering.", flush=True)
         except Exception as e:
@@ -104,7 +117,7 @@ class JQuantsV2Fetcher:
             if not code or code == "nan":
                 continue
             
-            # 4桁と5桁の不一致を吸収（code[:4] で判定）
+            # 事前フィルターが有効な場合のみチェック
             if candidate_codes is not None:
                 if code not in candidate_codes and code[:4] not in candidate_codes:
                     continue
@@ -163,10 +176,8 @@ class JQuantsV2Fetcher:
                                 print(f"  [{len(target_tickers)}/{limit}] Found: {ticker_base} | Cap: {mkt_cap/1e8:.1f}億 | Va: {row['Va_n']/1e6:.1f}M", flush=True)
                                 if len(target_tickers) >= limit:
                                     break
-                else:
-                    print(f"[DEBUG] FINS API Error for {query_code}: {f_resp.status_code}", flush=True)
             except Exception as e:
-                print(f"[DEBUG] Fetch exception for {query_code}: {e}", flush=True)
+                pass
             
             time.sleep(0.3)
 
