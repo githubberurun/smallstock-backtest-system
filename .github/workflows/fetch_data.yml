@@ -35,15 +35,15 @@ jobs:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           PYTHONUNBUFFERED: "1"
         run: |
-          # フォルダ作成（存在しない場合のエラー防止）
-          mkdir -p data
+          # フォルダ作成
+          mkdir -p Colog_github
           
           if [ -z "$JQUANTS_API_KEY" ]; then
             echo "Error: JQUANTS_API_KEY is not set in GitHub Secrets."
             exit 1
           fi
           
-          # 1. データ取得
+          # 1. データ取得（小型株スクリーニング含む）
           python -u data_fetcher.py
           
           # 2. 統合バックテスト実行
@@ -55,7 +55,7 @@ jobs:
         with:
           name: backtest-results
           path: |
-            data/*.parquet
-            data/*.txt
-            data/*.csv
+            Colog_github/*.parquet
+            Colog_github/*.txt
+            Colog_github/*.csv
             backtest_report.csv
