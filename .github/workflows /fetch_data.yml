@@ -1,0 +1,55 @@
+name: Weekly Backtest System
+
+on:
+  workflow_dispatch:      # 手動実行可能
+
+env:
+  # Node.js 20の非推奨警告への対応 (Node.js 24への強制移行フラグ)
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  run-system:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+        
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas pyarrow fastparquet numpy yfinance
+
+      - name: Execute Pipeline
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          # Pythonの標準出力をバッファリングせず即座にログへ書き出す設定
+          PYTHONUNBUFFERED: "1"
+        run: |
+          # JQUANTS_API_KEYが設定されていない場合はパイプラインを停止
+          if [ -z "$JQUANTS_API_KEY" ]; then
+            echo "Error: JQUANTS_API_KEY is not set in secrets."
+            exit 1
+          fi
+          
+          # 1. データ取得 (対象銘柄 & ベンチマーク) & 内部テスト
+          # -u フラグでバッファリングを無効化し、リアルタイムでログを表示
+          python -u data_fetcher.py
+          
+          # 2. 統合バックテスト実行
+          python -u backtest_runner.py
+
+      - name: Upload Results
+        if: always() # エラーが起きても可能な限り結果をアップロード
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: |
+            data/*.parquet
+            data/*.txt
+            data/*.csv
+            backtest_report.csv
