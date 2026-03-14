@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 # Pandas: https://pandas.pydata.org/docs/
 # yfinance: https://yfinance.readthedocs.io/en/latest/
 # J-Quants API v2: https://jpx-jquants.com/api/
+# GitHub Actions ENV: https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions
 # ==========================================
 
 def debug_log(msg: str) -> None:
@@ -55,13 +56,12 @@ class JQuantsV2Client:
             self._refresh_id_token()
             if not self.id_token: return {}
         
-        # J-Quantsは4桁の銘柄コードを想定
         url = f"{self.base_url}/statements/basic?code={ticker}"
         headers = {"Authorization": f"Bearer {self.id_token}"}
         
         try:
             res = requests.get(url, headers=headers, timeout=15)
-            if res.status_code == 401: # トークン切れの自動再試行
+            if res.status_code == 401: # トークン切れ
                 self._refresh_id_token()
                 headers["Authorization"] = f"Bearer {self.id_token}"
                 res = requests.get(url, headers=headers, timeout=15)
@@ -74,7 +74,7 @@ class JQuantsV2Client:
             return {}
 
 # ==========================================
-# ファンダメンタルズ・キャッシュマネージャー（J-Quants統合・自動修復版）
+# ファンダメンタルズ・キャッシュマネージャー
 # ==========================================
 class FundamentalCache:
     """J-Quantsからの情報取得負荷を下げるためのローカルキャッシュ"""
@@ -98,7 +98,6 @@ class FundamentalCache:
     def get_fundamentals(self, ticker: str) -> Dict[str, float]:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
-        # 【自動修復ロジック】キャッシュが存在しない、または前回エラー時の 0.0 データの場合は再取得
         needs_fetch = False
         if ticker not in self.data:
             needs_fetch = True
@@ -110,7 +109,6 @@ class FundamentalCache:
             try:
                 stmt = self.jq_client.get_statements(ticker)
                 
-                # J-Quantsのキー名から数値を取得 (Noneや空文字を考慮)
                 equity_raw = stmt.get("Equity", 0.0)
                 assets_raw = stmt.get("TotalAssets", 0.0)
                 income_raw = stmt.get("NetIncome", 0.0)
@@ -119,10 +117,7 @@ class FundamentalCache:
                 total_assets = float(assets_raw) if assets_raw is not None else 0.0
                 net_income = float(income_raw) if income_raw is not None else 0.0
                 
-                # 自己資本比率 (%) = 自己資本 / 総資産 * 100
                 equity_ratio = (equity / total_assets * 100.0) if total_assets > 0 else 0.0
-                
-                # ROE (%) = 当期純利益 / 自己資本 * 100
                 roe = (net_income / equity * 100.0) if equity > 0 else 0.0
                 
                 self.data[ticker] = {'roe': roe, 'equity_ratio': equity_ratio}
@@ -130,7 +125,6 @@ class FundamentalCache:
                 debug_log(f"Error calculating fundamental for {ticker}: {e}")
                 self.data[ticker] = {'roe': 0.0, 'equity_ratio': 0.0} 
             
-            # API制限・消失回避のため、1件ごとに保存
             try:
                 with open(self.filepath, 'w', encoding='utf-8') as f:
                     json.dump(self.data, f, ensure_ascii=False, indent=2)
@@ -167,7 +161,6 @@ class SmallCapStrategyAnalyzer:
 
         df['prev_close'] = df['close'].shift(1)
         
-        # 過去指標の完全継承
         df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma25'] = df['close'].rolling(window=25).mean()
         df['ma50'] = df['close'].rolling(window=50).mean()
@@ -211,7 +204,6 @@ class SmallCapStrategyAnalyzer:
         df['close_position'] = ((df['close'] - df['low']) / day_range).fillna(0)
         df['lowest_5'] = df['low'].rolling(window=5).min()
         
-        # TOPIX地合いフィルター
         if benchmark_df is not None and not benchmark_df.empty:
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
             benchmark_df['bm_ma50'] = benchmark_df['close'].rolling(window=50).mean()
@@ -234,16 +226,13 @@ class SmallCapStrategyAnalyzer:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         if not isinstance(fund_data, dict): raise TypeError("fund_data must be a dictionary")
         
-        # 【マクロ防衛】
         market_healthy = bool(row_dict.get('market_healthy', True))
         if not market_healthy or vix >= 25.0:
             return False, 0.0, False
             
-        # 【Quality（質）フィルター】
         roe = SmallCapStrategyAnalyzer._to_float(fund_data.get('roe', 0.0))
         eq_ratio = SmallCapStrategyAnalyzer._to_float(fund_data.get('equity_ratio', 0.0))
         
-        # ゾンビ企業は排除（ROE 10%以上、自己資本比率 50%以上）
         if roe < 10.0 or eq_ratio < 50.0:
             return False, 0.0, False 
             
@@ -258,9 +247,7 @@ class SmallCapStrategyAnalyzer:
 
         score = 0.0
         
-        # 【Momentum（勢い）ロジック】
         if curr_c > ma25_val and ma25_val > ma50_val and ma50_val > ma200_val:
-            # 出来高を伴う上昇を確認（出来高平均2倍以上 ＋ 上位70%以上の陽線引け）
             if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70:
                 score += 100.0
                 
@@ -328,7 +315,6 @@ class SmallCapPortfolioBacktester:
             df = SmallCapStrategyAnalyzer.calculate_indicators(df, bm_df)
             if df.empty: continue
             
-            # キャッシュからファンダを取得（不良データの場合はJ-Quantsで再取得・保存される）
             self.fund_cache.get_fundamentals(ticker)
             
             df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
@@ -343,7 +329,6 @@ class SmallCapPortfolioBacktester:
         self.sorted_dates = sorted(list(dates_set))
         debug_log(f"Timeline built. Total trading days: {len(self.sorted_dates)}")
         
-        # 【重要デバッグ】真の優良企業が全体のうち何社あるかを可視化
         passed_tickers = [t for t, data in self.fund_cache.data.items() if data.get('roe', 0.0) >= 10.0 and data.get('equity_ratio', 0.0) >= 50.0]
         debug_log(f"★ Quality Filter Passed Tickers (ROE>=10%, Eq>=50%): {len(passed_tickers)} / {len(self.fund_cache.data)}")
 
@@ -425,7 +410,6 @@ class SmallCapPortfolioBacktester:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                # 優良企業は育つまで時間がかかるためタイムストップを延長（15日）
                 if pos['days_held'] >= 15 and curr_c < (pos['entry_p'] * 1.03) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
@@ -444,7 +428,6 @@ class SmallCapPortfolioBacktester:
                 for ticker, row in today_market.items():
                     if ticker in positions: continue 
                     
-                    # キャッシュからファンダ情報を取得して評価
                     fund_data = self.fund_cache.get_fundamentals(ticker)
                     is_entry, score, is_high_risk = SmallCapStrategyAnalyzer.evaluate_entry(row, n_chg, vix, fund_data)
                     
@@ -500,7 +483,6 @@ def run_integrity_tests() -> None:
     res_df = SmallCapStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    # Q-Mo 正常系テスト
     dummy_row_ok = {
         'close': 1050.0, 'ma25': 1000.0, 'ma50': 950.0, 'ma200': 800.0,
         'vol_ratio': 2.5, 'is_bullish': True, 'close_position': 0.8,
@@ -514,7 +496,6 @@ def run_integrity_tests() -> None:
     except Exception as e:
         raise AssertionError(f"Failed handling valid data: {e}")
 
-    # ゾンビ企業排除テスト (ROE不足)
     dummy_fund_bad = {'roe': 5.0, 'equity_ratio': 60.0}
     try:
         is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, 0.0, 15.0, dummy_fund_bad)
@@ -522,7 +503,6 @@ def run_integrity_tests() -> None:
     except Exception as e:
         raise AssertionError(f"Failed handling zombie data: {e}")
 
-    # 異常値テスト
     dummy_row_err = {'ma200': np.nan, 'vol_ratio': 'invalid', 'market_healthy': 'error'}
     dummy_fund_err = {'roe': None, 'equity_ratio': 'error'}
     try:
@@ -535,14 +515,14 @@ def run_integrity_tests() -> None:
     debug_log("All integrity tests passed.")
 
 if __name__ == "__main__":
-    # 【必須】J-Quants v2 APIキーをここにセットしてください
-    JQ_API_KEY = "YOUR_JQUANTS_V2_API_KEY"
+    # GitHub Actions の環境変数(Secrets)から動的にAPIキーを取得する
+    JQ_API_KEY = os.environ.get("JQUANTS_API_KEY", "")
     
     run_integrity_tests()
     
-    if JQ_API_KEY == "YOUR_JQUANTS_V2_API_KEY":
-        print("\n[ERROR] J-Quants v2 APIキーがセットされていません。")
-        print("マイページから発行されたAPIキーを JQ_API_KEY に入力して再試行してください。")
+    if not JQ_API_KEY:
+        print("\n[ERROR] J-Quants v2 APIキーが環境変数 'JQUANTS_API_KEY' にセットされていません。")
+        print("GitHub Secretsの設定、またはローカルの環境変数を確認して再試行してください。")
         exit(1)
         
     try:
