@@ -9,13 +9,13 @@ from datetime import datetime, timedelta
 # 2025-2026年 最新公式ドキュメント準拠
 # Pandas: https://pandas.pydata.org/docs/
 # Requests: https://requests.readthedocs.io/en/latest/
-# J-Quants API Reference: https://jpx.gitbook.io/j-quants-ja/api-reference
+# J-Quants API Reference: https://jpx-jquants.com/ja/spec/eq-master
 # ==========================================
 
 BASE_URL: Final[str] = "https://api.jquants.com/v2"
 PRICES_ENDPOINT: Final[str] = "/equities/bars/daily"
 FINS_ENDPOINT: Final[str] = "/fins/summary"
-INFO_ENDPOINT: Final[str] = "/listed/info"
+INFO_ENDPOINT: Final[str] = "/equities/master" # V2最新エンドポイントに修正
 
 class JQuantsV2Fetcher:
     """J-Quants API v2準拠のキャッシュ対応・小型株データ取得クラス"""
@@ -33,24 +33,30 @@ class JQuantsV2Fetcher:
     def get_top_small_cap_tickers(self, limit: int = 300, max_market_cap: float = 50_000_000_000.0) -> List[str]:
         """売買代金上位銘柄の中から、小型株（500億未満）を効率的に抽出"""
         print("[INFO] Step 1: Fetching master listed info to filter candidates...", flush=True)
+        candidate_codes = None
+        
         try:
             info_resp = requests.get(f"{BASE_URL}{INFO_ENDPOINT}", headers=self.headers, timeout=30)
-            if info_resp.status_code != 200:
-                print(f"[ERROR] Failed to fetch listed info: {info_resp.text}")
-                return []
-            info_df = pd.DataFrame(info_resp.json().get("data", []))
+            if info_resp.status_code == 200:
+                info_data = info_resp.json().get("data", [])
+                info_df = pd.DataFrame(info_data)
+                
+                # V2でのカラム名変更に柔軟に対応
+                market_col = next((c for c in ["MarketCodeName", "MarketCode", "Section"] if c in info_df.columns), None)
+                sector_col = next((c for c in ["SectorName", "SectorCode", "Sector"] if c in info_df.columns), None)
+                code_col = next((c for c in ["Code", "code"] if c in info_df.columns), "Code")
+                
+                if market_col and code_col in info_df.columns:
+                    small_cap_segments = ["Growth", "Standard", "グロース", "スタンダード", "G", "S"]
+                    candidates_info = info_df[info_df[market_col].astype(str).str.contains("|".join(small_cap_segments), na=True)]
+                    if sector_col:
+                        candidates_info = candidates_info[~candidates_info[sector_col].astype(str).str.contains("ETF|ETN|REIT", na=False)]
+                    candidate_codes = set(candidates_info[code_col].astype(str).tolist())
+                    print(f"[INFO] Candidates filtered: {len(candidate_codes)} tickers from Growth/Standard segments.", flush=True)
+            else:
+                print(f"[WARN] Master info fetch failed ({info_resp.status_code}): {info_resp.text}. Proceeding without pre-filtering.", flush=True)
         except Exception as e:
-            print(f"[ERROR] Exception in listed info fetch: {e}")
-            return []
-
-        # 1. 候補の絞り込み (プライム市場の大型株やREITなどはスキャンから除外して高速化)
-        small_cap_segments = ["Growth", "Standard", "グロース", "スタンダード"]
-        candidates_info = info_df[
-            (info_df["MarketCodeName"].str.contains("|".join(small_cap_segments), na=True)) &
-            (~info_df["SectorName"].str.contains("ETF|ETN|REIT", na=False))
-        ]
-        candidate_codes = set(candidates_info["Code"].tolist())
-        print(f"[INFO] Candidates filtered: {len(candidate_codes)} tickers from Growth/Standard segments.", flush=True)
+            print(f"[WARN] Exception in master info fetch: {e}. Proceeding without pre-filtering.", flush=True)
 
         print("[INFO] Step 2: Fetching daily quotes for all tickers...", flush=True)
         target_date = datetime.now().date()
@@ -72,8 +78,8 @@ class JQuantsV2Fetcher:
 
         # 2. 売買代金でソート
         df_quotes = pd.DataFrame(daily_quotes)
-        df_quotes["Va_n"] = pd.to_numeric(df_quotes.get("Va", 0), errors="coerce")
-        df_quotes["C_n"] = pd.to_numeric(df_quotes.get("C", 0), errors="coerce")
+        df_quotes["Va_n"] = pd.to_numeric(df_quotes.get("Va", df_quotes.get("TurnoverValue", 0)), errors="coerce")
+        df_quotes["C_n"] = pd.to_numeric(df_quotes.get("C", df_quotes.get("Close", 0)), errors="coerce")
         df_quotes = df_quotes.sort_values("Va_n", ascending=False)
 
         target_tickers: List[str] = []
@@ -83,17 +89,22 @@ class JQuantsV2Fetcher:
         print(f"[INFO] Step 3: Verifying Market Cap for top {scan_limit} turnover candidates...", flush=True)
         for _, row in df_quotes.iterrows():
             code = str(row.get("Code", ""))
-            if code not in candidate_codes:
+            if not code:
+                continue
+            
+            # フォールバック: candidate_codes が有効な場合のみ事前フィルタ適用
+            if candidate_codes is not None and code not in candidate_codes:
                 continue
             
             processed_count += 1
             if processed_count > scan_limit:
                 break
 
-            # ★ キャッシュ機能: すでにファイルが存在する銘柄は時価総額チェックAPIをスキップ
-            if os.path.exists(f"Colog_github/{code[:4]}.parquet"):
-                target_tickers.append(code[:4])
-                print(f"  [{len(target_tickers)}/{limit}] Cached Small Cap Loaded: {code[:4]}", flush=True)
+            ticker_base = code[:4]
+            # キャッシュ機能: すでにファイルが存在する銘柄は時価総額チェックAPIをスキップ
+            if os.path.exists(f"Colog_github/{ticker_base}.parquet"):
+                target_tickers.append(ticker_base)
+                print(f"  [{len(target_tickers)}/{limit}] Cached Small Cap Loaded: {ticker_base}", flush=True)
                 if len(target_tickers) >= limit:
                     break
                 continue
@@ -113,11 +124,19 @@ class JQuantsV2Fetcher:
                 if f_resp.status_code == 200:
                     f_data = f_resp.json().get("data", [])
                     if f_data:
-                        shares = float(f_data[-1].get("NumberOfIssuedAndOutstandingSharesAtTheEndOfPeriod", 0))
+                        latest = f_data[-1]
+                        # V2でのキー名揺れに対応
+                        shares_keys = ["NumberOfIssuedAndOutstandingSharesAtTheEndOfPeriod", "IssuedAndOutstandingShares", "Shares"]
+                        shares = 0.0
+                        for k in shares_keys:
+                            if k in latest and latest[k]:
+                                shares = float(latest[k])
+                                break
+                        
                         mkt_cap = close_p * shares
                         if 0 < mkt_cap < max_market_cap:
-                            target_tickers.append(code[:4])
-                            print(f"  [{len(target_tickers)}/{limit}] Found: {code[:4]} | Cap: {mkt_cap/1e8:.1f}億 | Va: {row['Va_n']/1e6:.1f}M", flush=True)
+                            target_tickers.append(ticker_base)
+                            print(f"  [{len(target_tickers)}/{limit}] Found: {ticker_base} | Cap: {mkt_cap/1e8:.1f}億 | Va: {row['Va_n']/1e6:.1f}M", flush=True)
                             if len(target_tickers) >= limit:
                                 break
             except Exception as e:
