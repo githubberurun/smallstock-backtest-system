@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 
 # ==========================================
 # 2025-2026年 最新公式ドキュメント準拠
+# Pandas: https://pandas.pydata.org/docs/
+# yfinance: https://yfinance.readthedocs.io/en/latest/
 # ==========================================
 
 def debug_log(msg: str) -> None:
@@ -40,7 +42,9 @@ class FundamentalCache:
         if ticker not in self.data:
             debug_log(f"Fetching fundamentals for {ticker}...")
             try:
-                info = yf.Ticker(ticker).info
+                # 【修正箇所】日本株の場合は末尾に '.T' を付与して yfinance に問い合わせる
+                yf_ticker = f"{ticker}.T" if ticker.isdigit() else ticker
+                info = yf.Ticker(yf_ticker).info
                 
                 # ROEの取得 (Noneの場合は0とする)
                 roe_raw = info.get('returnOnEquity', 0.0)
@@ -49,7 +53,6 @@ class FundamentalCache:
                 # 自己資本比率の計算 (Debt to Equityから逆算)
                 dte_raw = info.get('debtToEquity', 0.0)
                 dte = float(dte_raw) if dte_raw is not None else 0.0
-                # D/E ratioがパーセント表記の場合と倍率表記の場合があるが、yfinanceは通常パーセント(例: 50 = 50%)
                 equity_ratio = 100.0 / (1.0 + (dte / 100.0))
                 
                 self.data[ticker] = {'roe': roe, 'equity_ratio': equity_ratio}
@@ -167,12 +170,12 @@ class SmallCapStrategyAnalyzer:
             return False, 0.0, False
             
         # 【Quality（質）フィルター】
-        # アドバイス通り、ROE 10%以上、自己資本比率 50%以上を「必須条件」とする
         roe = SmallCapStrategyAnalyzer._to_float(fund_data.get('roe', 0.0))
         eq_ratio = SmallCapStrategyAnalyzer._to_float(fund_data.get('equity_ratio', 0.0))
         
+        # ゾンビ企業は問答無用で排除
         if roe < 10.0 or eq_ratio < 50.0:
-            return False, 0.0, False # ゾンビ企業は問答無用で排除
+            return False, 0.0, False 
             
         curr_c = SmallCapStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         ma25_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('ma25', 0.0))
@@ -189,8 +192,7 @@ class SmallCapStrategyAnalyzer:
         # 1. パーフェクトオーダー（MA25 > MA50 > MA200）の強いトレンド
         if curr_c > ma25_val and ma25_val > ma50_val and ma50_val > ma200_val:
             
-            # 2. アドバイス通り「出来高を伴う上昇を確認」してからエントリー
-            # 出来高が平均の2.0倍以上 ＋ 強い陽線（上位70%以上で引ける）
+            # 2. 出来高を伴う上昇を確認（出来高平均2倍以上 ＋ 上位70%以上の陽線引け）
             if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70:
                 score += 100.0
                 
@@ -238,8 +240,7 @@ class SmallCapPortfolioBacktester:
         self.stats = {
             'orders_placed': 0, 'orders_exec': 0,
             'time_stops': 0, 'hard_stops': 0, 'trailing_stops': 0,
-            'breakeven_stops': 0, 'climax_exits': 0, 'gap_cancels': 0,
-            'quality_rejects': 0 # ゾンビ企業排除数
+            'breakeven_stops': 0, 'climax_exits': 0, 'gap_cancels': 0
         }
         
         debug_log("Loading and calculating indicators for SMALL CAP tickers...")
@@ -257,7 +258,7 @@ class SmallCapPortfolioBacktester:
             df = SmallCapStrategyAnalyzer.calculate_indicators(df, bm_df)
             if df.empty: continue
             
-            # ファンダ取得（キャッシュになければyfinance経由で取得し保存）
+            # キャッシュからファンダを取得（なければ.T付与で取得・保存）
             self.fund_cache.get_fundamentals(ticker)
             
             df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
@@ -369,6 +370,7 @@ class SmallCapPortfolioBacktester:
                 for ticker, row in today_market.items():
                     if ticker in positions: continue 
                     
+                    # キャッシュからファンダ情報を取得して評価
                     fund_data = self.fund_cache.get_fundamentals(ticker)
                     is_entry, score, is_high_risk = SmallCapStrategyAnalyzer.evaluate_entry(row, n_chg, vix, fund_data)
                     
