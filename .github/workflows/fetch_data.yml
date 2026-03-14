@@ -2,8 +2,8 @@ name: Weekly Backtest System
 
 on:
   push:
-    branches: [ "main" ] # push時にも動くようにして動作確認しやすくします
-  workflow_dispatch:      # 手動実行ボタンも残します
+    branches: [ "main" ] 
+  workflow_dispatch:      
 
 env:
   # Node.js 20の非推奨警告への対応 (2025-2026年推奨設定)
@@ -13,17 +13,26 @@ jobs:
   run-system:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 成果物をリポジトリに書き戻す必要がある場合に備え
+      contents: write 
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # 2回目以降の高速化のためにキャッシュを有効化
+      - name: Cache stock data
+        uses: actions/cache@v4
+        with:
+          path: Colog_github
+          # キャッシュキー。月次や日次でリフレッシュされるように設定
+          key: stock-data-${{ runner.os }}-${{ hashFiles('**/data_fetcher.py') }}-${{ format('{0}-{1}', github.run_id, github.run_number) }}
+          restore-keys: |
+            stock-data-${{ runner.os }}-
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          # cache: 'pip' を削除し、requirements.txt不在によるエラーを回避
         
       - name: Install dependencies
         run: |
@@ -43,7 +52,7 @@ jobs:
             exit 1
           fi
           
-          # 1. データ取得（小型株スクリーニング含む）
+          # 1. データ取得（小型株スクリーニングおよびキャッシュスキップ含む）
           python -u data_fetcher.py
           
           # 2. 統合バックテスト実行
