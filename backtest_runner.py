@@ -53,6 +53,7 @@ class SmallCapStrategyAnalyzer:
         df['bb_p1'] = df['ma20'] + df['std20'] 
         df['prev_low'] = df['low'].shift(1)
         
+        # 小型株は値動きが激しいため、MACDの反応を重視
         df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
         df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = df['ema12'] - df['ema26']
@@ -90,6 +91,7 @@ class SmallCapStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
+        # 小型株特有のマクロフィルター
         if n_chg <= -3.0 or vix >= 35.0:
             return False, 0.0, False
             
@@ -100,14 +102,16 @@ class SmallCapStrategyAnalyzer:
         macd_improving = bool(row_dict.get('macd_improving', False))
         d25 = SmallCapStrategyAnalyzer._to_float(row_dict.get('dev25', 0.0))
 
+        # 小型株特有の「ナイフ落下」排除
         if d25 <= -20.0:
             return False, 0.0, False
 
         score = 0.0
+        # 出来高急増（大商い）を伴う反発を狙うベースロジック
         if rsi_val < 35.0 and is_bullish:
             score += 50.0
             if macd_improving and vol_ratio >= 1.5:
-                score += 50.0 
+                score += 50.0 # 出来高クライマックス + MACD好転で満点
                 
         is_entry = (score >= 80.0)
         return is_entry, float(score), (vix >= 20.0)
@@ -118,6 +122,7 @@ class SmallCapStrategyAnalyzer:
         curr_price = SmallCapStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = SmallCapStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
+        # 小型株の指値は大型株より「深く」設定
         base_offset = 1.0 
         if is_high_risk:
             base_offset = 2.0 
