@@ -42,9 +42,9 @@ class JQuantsV2Fetcher:
                 if info_data:
                     info_df = pd.DataFrame(info_data)
                     
-                    # V2でのカラム名揺れ（大文字小文字等）に完全対応する動的探索
-                    market_col = next((c for c in info_df.columns if str(c).lower() in ["marketcodename", "marketcode", "market_code", "section", "segment"]), None)
-                    sector_col = next((c for c in info_df.columns if str(c).lower() in ["sectorname", "sectorcode", "sector_name", "sector"]), None)
+                    # 判明した最新のV2カラム名（MktNm, S33Nmなど）を網羅した動的探索
+                    market_col = next((c for c in info_df.columns if str(c).lower() in ["marketcodename", "marketcode", "market_code", "section", "segment", "mktnm", "mkt"]), None)
+                    sector_col = next((c for c in info_df.columns if str(c).lower() in ["sectorname", "sectorcode", "sector_name", "sector", "s33nm", "s33", "s17nm", "s17"]), None)
                     code_col = next((c for c in info_df.columns if str(c).lower() in ["code", "symbol"]), "Code")
                     
                     if market_col and code_col in info_df.columns:
@@ -87,7 +87,7 @@ class JQuantsV2Fetcher:
         code_col_q = "Code" if "Code" in df_quotes.columns else "code" if "code" in df_quotes.columns else None
 
         if va_col is None or c_col is None or code_col_q is None:
-            print(f"[ERROR] Required columns missing. Available: {df_quotes.columns.tolist()}", flush=True)
+            print(f"[ERROR] Required columns missing in daily quotes. Available: {df_quotes.columns.tolist()}", flush=True)
             return []
 
         df_quotes["Va_n"] = pd.to_numeric(df_quotes[va_col], errors="coerce")
@@ -104,7 +104,7 @@ class JQuantsV2Fetcher:
             if not code or code == "nan":
                 continue
             
-            # ★【最重要修正】4桁と5桁の不一致を吸収（code[:4] で判定）
+            # 4桁と5桁の不一致を吸収（code[:4] で判定）
             if candidate_codes is not None:
                 if code not in candidate_codes and code[:4] not in candidate_codes:
                     continue
@@ -127,13 +127,14 @@ class JQuantsV2Fetcher:
             if close_p <= 0 or pd.isna(close_p): 
                 continue
 
-            # 財務情報を取得して時価総額を確認
+            # 財務情報を取得して時価総額を確認 (確実に5桁コードにする)
+            query_code = f"{ticker_base}0"
             try:
-                f_resp = requests.get(f"{BASE_URL}{FINS_ENDPOINT}", headers=self.headers, params={"code": code}, timeout=10)
+                f_resp = requests.get(f"{BASE_URL}{FINS_ENDPOINT}", headers=self.headers, params={"code": query_code}, timeout=10)
                 if f_resp.status_code == 429:
                     print("[WARN] Rate limit hit. Sleeping 10s...", flush=True)
                     time.sleep(10)
-                    f_resp = requests.get(f"{BASE_URL}{FINS_ENDPOINT}", headers=self.headers, params={"code": code}, timeout=10)
+                    f_resp = requests.get(f"{BASE_URL}{FINS_ENDPOINT}", headers=self.headers, params={"code": query_code}, timeout=10)
 
                 if f_resp.status_code == 200:
                     f_data = f_resp.json().get("data", [])
@@ -152,16 +153,20 @@ class JQuantsV2Fetcher:
                                         if val > 100000: # 発行済株式数は通常10万以上
                                             shares = val
                                             break
-                                    except: pass
+                                    except ValueError: 
+                                        pass
                         
-                        mkt_cap = close_p * shares
-                        if 0 < mkt_cap < max_market_cap:
-                            target_tickers.append(ticker_base)
-                            print(f"  [{len(target_tickers)}/{limit}] Found: {ticker_base} | Cap: {mkt_cap/1e8:.1f}億 | Va: {row['Va_n']/1e6:.1f}M", flush=True)
-                            if len(target_tickers) >= limit:
-                                break
+                        if shares > 0:
+                            mkt_cap = close_p * shares
+                            if 0 < mkt_cap < max_market_cap:
+                                target_tickers.append(ticker_base)
+                                print(f"  [{len(target_tickers)}/{limit}] Found: {ticker_base} | Cap: {mkt_cap/1e8:.1f}億 | Va: {row['Va_n']/1e6:.1f}M", flush=True)
+                                if len(target_tickers) >= limit:
+                                    break
+                else:
+                    print(f"[DEBUG] FINS API Error for {query_code}: {f_resp.status_code}", flush=True)
             except Exception as e:
-                pass
+                print(f"[DEBUG] Fetch exception for {query_code}: {e}", flush=True)
             
             time.sleep(0.3)
 
@@ -294,7 +299,7 @@ if __name__ == "__main__":
     for i, target_ticker in enumerate(target_tickers):
         path = f"Colog_github/{target_ticker}.parquet"
         
-        # ★ キャッシュ機能: すでにファイルが存在する場合は取得APIをスキップ
+        # キャッシュ機能: すでにファイルが存在する場合は取得APIをスキップ
         if os.path.exists(path):
             print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}... CACHED (SKIP)", flush=True)
             continue
