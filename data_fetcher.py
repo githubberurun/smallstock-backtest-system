@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 BASE_URL: Final[str] = "https://api.jquants.com/v2"
 PRICES_ENDPOINT: Final[str] = "/equities/bars/daily"
 FINS_ENDPOINT: Final[str] = "/fins/summary"
-INFO_ENDPOINT: Final[str] = "/equities/master" # V2最新エンドポイントに修正
+INFO_ENDPOINT: Final[str] = "/equities/master" 
 
 class JQuantsV2Fetcher:
     """J-Quants API v2準拠のキャッシュ対応・小型株データ取得クラス"""
@@ -39,22 +39,25 @@ class JQuantsV2Fetcher:
             info_resp = requests.get(f"{BASE_URL}{INFO_ENDPOINT}", headers=self.headers, timeout=30)
             if info_resp.status_code == 200:
                 info_data = info_resp.json().get("data", [])
-                info_df = pd.DataFrame(info_data)
-                
-                # V2でのカラム名変更に柔軟に対応
-                market_col = next((c for c in ["MarketCodeName", "MarketCode", "Section"] if c in info_df.columns), None)
-                sector_col = next((c for c in ["SectorName", "SectorCode", "Sector"] if c in info_df.columns), None)
-                code_col = next((c for c in ["Code", "code"] if c in info_df.columns), "Code")
-                
-                if market_col and code_col in info_df.columns:
-                    small_cap_segments = ["Growth", "Standard", "グロース", "スタンダード", "G", "S"]
-                    candidates_info = info_df[info_df[market_col].astype(str).str.contains("|".join(small_cap_segments), na=True)]
-                    if sector_col:
-                        candidates_info = candidates_info[~candidates_info[sector_col].astype(str).str.contains("ETF|ETN|REIT", na=False)]
-                    candidate_codes = set(candidates_info[code_col].astype(str).tolist())
-                    print(f"[INFO] Candidates filtered: {len(candidate_codes)} tickers from Growth/Standard segments.", flush=True)
+                if info_data:
+                    info_df = pd.DataFrame(info_data)
+                    
+                    # V2でのカラム名揺れ（大文字小文字等）に完全対応する動的探索
+                    market_col = next((c for c in info_df.columns if str(c).lower() in ["marketcodename", "marketcode", "market_code", "section", "segment"]), None)
+                    sector_col = next((c for c in info_df.columns if str(c).lower() in ["sectorname", "sectorcode", "sector_name", "sector"]), None)
+                    code_col = next((c for c in info_df.columns if str(c).lower() in ["code", "symbol"]), "Code")
+                    
+                    if market_col and code_col in info_df.columns:
+                        small_cap_segments = ["Growth", "Standard", "グロース", "スタンダード", "G", "S"]
+                        candidates_info = info_df[info_df[market_col].astype(str).str.contains("|".join(small_cap_segments), na=True)]
+                        if sector_col:
+                            candidates_info = candidates_info[~candidates_info[sector_col].astype(str).str.contains("ETF|ETN|REIT", na=False)]
+                        candidate_codes = set(candidates_info[code_col].astype(str).tolist())
+                        print(f"[INFO] Candidates filtered: {len(candidate_codes)} tickers from Growth/Standard segments.", flush=True)
+                    else:
+                        print(f"[WARN] Market column not found. Available cols: {info_df.columns.tolist()}", flush=True)
             else:
-                print(f"[WARN] Master info fetch failed ({info_resp.status_code}): {info_resp.text}. Proceeding without pre-filtering.", flush=True)
+                print(f"[WARN] Master info fetch failed ({info_resp.status_code}). Proceeding without pre-filtering.", flush=True)
         except Exception as e:
             print(f"[WARN] Exception in master info fetch: {e}. Proceeding without pre-filtering.", flush=True)
 
@@ -78,8 +81,17 @@ class JQuantsV2Fetcher:
 
         # 2. 売買代金でソート
         df_quotes = pd.DataFrame(daily_quotes)
-        df_quotes["Va_n"] = pd.to_numeric(df_quotes.get("Va", df_quotes.get("TurnoverValue", 0)), errors="coerce")
-        df_quotes["C_n"] = pd.to_numeric(df_quotes.get("C", df_quotes.get("Close", 0)), errors="coerce")
+        
+        va_col = "Va" if "Va" in df_quotes.columns else "TurnoverValue" if "TurnoverValue" in df_quotes.columns else None
+        c_col = "C" if "C" in df_quotes.columns else "Close" if "Close" in df_quotes.columns else None
+        code_col_q = "Code" if "Code" in df_quotes.columns else "code" if "code" in df_quotes.columns else None
+
+        if va_col is None or c_col is None or code_col_q is None:
+            print(f"[ERROR] Required columns missing. Available: {df_quotes.columns.tolist()}", flush=True)
+            return []
+
+        df_quotes["Va_n"] = pd.to_numeric(df_quotes[va_col], errors="coerce")
+        df_quotes["C_n"] = pd.to_numeric(df_quotes[c_col], errors="coerce")
         df_quotes = df_quotes.sort_values("Va_n", ascending=False)
 
         target_tickers: List[str] = []
@@ -88,29 +100,31 @@ class JQuantsV2Fetcher:
         
         print(f"[INFO] Step 3: Verifying Market Cap for top {scan_limit} turnover candidates...", flush=True)
         for _, row in df_quotes.iterrows():
-            code = str(row.get("Code", ""))
-            if not code:
+            code = str(row[code_col_q])
+            if not code or code == "nan":
                 continue
             
-            # フォールバック: candidate_codes が有効な場合のみ事前フィルタ適用
-            if candidate_codes is not None and code not in candidate_codes:
-                continue
+            # ★【最重要修正】4桁と5桁の不一致を吸収（code[:4] で判定）
+            if candidate_codes is not None:
+                if code not in candidate_codes and code[:4] not in candidate_codes:
+                    continue
             
             processed_count += 1
             if processed_count > scan_limit:
                 break
 
             ticker_base = code[:4]
-            # キャッシュ機能: すでにファイルが存在する銘柄は時価総額チェックAPIをスキップ
+            # キャッシュ機能
             if os.path.exists(f"Colog_github/{ticker_base}.parquet"):
-                target_tickers.append(ticker_base)
-                print(f"  [{len(target_tickers)}/{limit}] Cached Small Cap Loaded: {ticker_base}", flush=True)
+                if ticker_base not in target_tickers:
+                    target_tickers.append(ticker_base)
+                    print(f"  [{len(target_tickers)}/{limit}] Cached Small Cap Loaded: {ticker_base}", flush=True)
                 if len(target_tickers) >= limit:
                     break
                 continue
 
             close_p = float(row["C_n"])
-            if close_p <= 0: 
+            if close_p <= 0 or pd.isna(close_p): 
                 continue
 
             # 財務情報を取得して時価総額を確認
@@ -125,13 +139,20 @@ class JQuantsV2Fetcher:
                     f_data = f_resp.json().get("data", [])
                     if f_data:
                         latest = f_data[-1]
-                        # V2でのキー名揺れに対応
-                        shares_keys = ["NumberOfIssuedAndOutstandingSharesAtTheEndOfPeriod", "IssuedAndOutstandingShares", "Shares"]
                         shares = 0.0
-                        for k in shares_keys:
-                            if k in latest and latest[k]:
-                                shares = float(latest[k])
-                                break
+                        
+                        # V2キー名揺れ対応（EPS等を除外し、株式数を動的に探索）
+                        for k, v in latest.items():
+                            if v is None or str(v).strip() == "": continue
+                            k_lower = str(k).lower()
+                            if "share" in k_lower or "outstanding" in k_lower or "発行済" in str(k):
+                                if "per" not in k_lower and "eps" not in k_lower and "dividend" not in k_lower:
+                                    try:
+                                        val = float(v)
+                                        if val > 100000: # 発行済株式数は通常10万以上
+                                            shares = val
+                                            break
+                                    except: pass
                         
                         mkt_cap = close_p * shares
                         if 0 < mkt_cap < max_market_cap:
