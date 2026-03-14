@@ -1,14 +1,13 @@
 import pandas as pd
 import numpy as np
 import os
+import json
 import yfinance as yf
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timedelta
 
 # ==========================================
 # 2025-2026年 最新公式ドキュメント準拠
-# Pandas: https://pandas.pydata.org/docs/
-# yfinance: https://yfinance.readthedocs.io/en/latest/
 # ==========================================
 
 def debug_log(msg: str) -> None:
@@ -17,7 +16,58 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. 小型株専用・統合分析エンジン (Stealth Trend Accumulation)
+# ファンダメンタルズ・キャッシュマネージャー
+# ==========================================
+class FundamentalCache:
+    """yfinanceからの情報取得負荷を下げるためのローカルキャッシュ"""
+    def __init__(self, data_dir: str):
+        if not isinstance(data_dir, str): raise TypeError("data_dir must be string")
+        self.filepath = os.path.join(data_dir, "fundamentals_cache.json")
+        self.data: Dict[str, Dict[str, float]] = self._load()
+
+    def _load(self) -> Dict[str, Dict[str, float]]:
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                debug_log(f"Failed to load fundamental cache: {e}")
+        return {}
+
+    def get_fundamentals(self, ticker: str) -> Dict[str, float]:
+        if not isinstance(ticker, str): raise TypeError("ticker must be string")
+        
+        if ticker not in self.data:
+            debug_log(f"Fetching fundamentals for {ticker}...")
+            try:
+                info = yf.Ticker(ticker).info
+                
+                # ROEの取得 (Noneの場合は0とする)
+                roe_raw = info.get('returnOnEquity', 0.0)
+                roe = float(roe_raw) * 100 if roe_raw is not None else 0.0
+                
+                # 自己資本比率の計算 (Debt to Equityから逆算)
+                dte_raw = info.get('debtToEquity', 0.0)
+                dte = float(dte_raw) if dte_raw is not None else 0.0
+                # D/E ratioがパーセント表記の場合と倍率表記の場合があるが、yfinanceは通常パーセント(例: 50 = 50%)
+                equity_ratio = 100.0 / (1.0 + (dte / 100.0))
+                
+                self.data[ticker] = {'roe': roe, 'equity_ratio': equity_ratio}
+            except Exception as e:
+                debug_log(f"Error fetching fundamental for {ticker}: {e}")
+                self.data[ticker] = {'roe': 0.0, 'equity_ratio': 0.0} # 取得失敗時は0（足切り対象）
+            
+            # API制限回避とクラッシュ対策のため、1件ごとに保存
+            try:
+                with open(self.filepath, 'w', encoding='utf-8') as f:
+                    json.dump(self.data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                debug_log(f"Failed to save cache: {e}")
+                
+        return self.data[ticker]
+
+# ==========================================
+# 1. 小型株専用・統合分析エンジン (Q-Mo Strategy)
 # ==========================================
 class SmallCapStrategyAnalyzer:
     @staticmethod
@@ -44,7 +94,7 @@ class SmallCapStrategyAnalyzer:
 
         df['prev_close'] = df['close'].shift(1)
         
-        # 過去の分析指標をすべて完全継承（他分析やダマシ判定との互換性維持のため）
+        # 過去指標の完全継承
         df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma25'] = df['close'].rolling(window=25).mean()
         df['ma50'] = df['close'].rolling(window=50).mean()
@@ -71,7 +121,6 @@ class SmallCapStrategyAnalyzer:
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, np.nan)).fillna(0)))
         
-        # ATR (ボラティリティ指標)
         tr = pd.concat([
             (df['high'] - df['low']), 
             (df['high'] - df['close'].shift()).abs(), 
@@ -79,11 +128,8 @@ class SmallCapStrategyAnalyzer:
         ], axis=1).max(axis=1)
         df['tr'] = tr
         df['atr'] = df['tr'].rolling(window=14).mean() 
-        
-        # 【新指標：ボラティリティ比率（静かなる蓄積の検知）】
         df['atr_pct'] = (df['atr'] / df['close']) * 100
         
-        # 出来高分析
         df['vol_ma25'] = df['volume'].rolling(25).mean().replace(0, np.nan)
         df['vol_ratio'] = (df['volume'] / df['vol_ma25']).fillna(0)
         
@@ -92,7 +138,7 @@ class SmallCapStrategyAnalyzer:
         df['close_position'] = ((df['close'] - df['low']) / day_range).fillna(0)
         df['lowest_5'] = df['low'].rolling(window=5).min()
         
-        # TOPIX地合いフィルター（国内専用の防壁として機能）
+        # TOPIX地合いフィルター
         if benchmark_df is not None and not benchmark_df.empty:
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
             benchmark_df['bm_ma50'] = benchmark_df['close'].rolling(window=50).mean()
@@ -111,41 +157,42 @@ class SmallCapStrategyAnalyzer:
         return df
 
     @staticmethod
-    def evaluate_entry(row_dict: Dict[str, Any], n_chg: float, vix: float) -> Tuple[bool, float, bool]:
+    def evaluate_entry(row_dict: Dict[str, Any], n_chg: float, vix: float, fund_data: Dict[str, float]) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
+        if not isinstance(fund_data, dict): raise TypeError("fund_data must be a dictionary")
         
-        # 日本固有の相場崩壊を防ぐため、TOPIXがダウントレンドの時は完全停止
+        # 【マクロ防衛】
         market_healthy = bool(row_dict.get('market_healthy', True))
-        if not market_healthy or vix >= 30.0:
+        if not market_healthy or vix >= 25.0:
             return False, 0.0, False
             
+        # 【Quality（質）フィルター】
+        # アドバイス通り、ROE 10%以上、自己資本比率 50%以上を「必須条件」とする
+        roe = SmallCapStrategyAnalyzer._to_float(fund_data.get('roe', 0.0))
+        eq_ratio = SmallCapStrategyAnalyzer._to_float(fund_data.get('equity_ratio', 0.0))
+        
+        if roe < 10.0 or eq_ratio < 50.0:
+            return False, 0.0, False # ゾンビ企業は問答無用で排除
+            
         curr_c = SmallCapStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
+        ma25_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('ma25', 0.0))
         ma50_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('ma50', 0.0))
         ma200_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('ma200', 0.0))
         
-        atr_pct = SmallCapStrategyAnalyzer._to_float(row_dict.get('atr_pct', 10.0))
         vol_ratio = SmallCapStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0))
-        rs_21 = SmallCapStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0))
-        d25 = SmallCapStrategyAnalyzer._to_float(row_dict.get('dev25', 0.0))
+        is_bullish = bool(row_dict.get('is_bullish', False))
+        close_pos = SmallCapStrategyAnalyzer._to_float(row_dict.get('close_position', 0.0))
 
         score = 0.0
         
-        # 【ステルス・トレンド（静かなる蓄積）ロジック】
-        # 1. 退屈で強固な上昇トレンド（MA50がMA200より上にあり、株価も上）
-        if curr_c > ma50_val and ma50_val > ma200_val:
+        # 【Momentum（勢い）ロジック】
+        # 1. パーフェクトオーダー（MA25 > MA50 > MA200）の強いトレンド
+        if curr_c > ma25_val and ma25_val > ma50_val and ma50_val > ma200_val:
             
-            # 2. TOPIXよりパフォーマンスが良い（相対強度プラス）
-            if rs_21 > 0.0:
-                
-                # 3. ボラティリティが極端に低い（ATRが株価の4.0%未満 ＝ 乱高下しない退屈な銘柄）
-                if atr_pct < 4.0:
-                    
-                    # 4. 誰も注目していない（出来高が25日平均の1.2倍未満 ＝ 煽りやイナゴがいない）
-                    if vol_ratio < 1.2:
-                        
-                        # 5. MA25から極端に乖離していない（高値掴み防止）
-                        if -2.0 <= d25 <= 5.0:
-                            score += 100.0
+            # 2. アドバイス通り「出来高を伴う上昇を確認」してからエントリー
+            # 出来高が平均の2.0倍以上 ＋ 強い陽線（上位70%以上で引ける）
+            if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70:
+                score += 100.0
                 
         is_entry = (score >= 100.0) 
         return is_entry, float(score), False
@@ -184,13 +231,15 @@ class SmallCapPortfolioBacktester:
         if not isinstance(data_dir, str): raise TypeError("data_dir must be string")
         self.cash: float = initial_cash
         self.initial_cash: float = initial_cash
-        self.max_positions: int = 5 
+        self.max_positions: int = max_positions
         self.us_market = USMarketCache()
+        self.fund_cache = FundamentalCache(data_dir)
         
         self.stats = {
             'orders_placed': 0, 'orders_exec': 0,
             'time_stops': 0, 'hard_stops': 0, 'trailing_stops': 0,
-            'breakeven_stops': 0, 'inago_exits': 0, 'gap_cancels': 0 
+            'breakeven_stops': 0, 'climax_exits': 0, 'gap_cancels': 0,
+            'quality_rejects': 0 # ゾンビ企業排除数
         }
         
         debug_log("Loading and calculating indicators for SMALL CAP tickers...")
@@ -207,6 +256,9 @@ class SmallCapPortfolioBacktester:
             df = pd.read_parquet(f"{data_dir}/{file}")
             df = SmallCapStrategyAnalyzer.calculate_indicators(df, bm_df)
             if df.empty: continue
+            
+            # ファンダ取得（キャッシュになければyfinance経由で取得し保存）
+            self.fund_cache.get_fundamentals(ticker)
             
             df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
             records = df.to_dict(orient='records')
@@ -242,7 +294,6 @@ class SmallCapPortfolioBacktester:
                     
                     self.stats['orders_placed'] += 1
                     
-                    # ギャップアップ・ダウン回避
                     if open_p > (prev_close * 1.02) or open_p < (prev_close * 0.98):
                         self.stats['gap_cancels'] += 1
                         continue 
@@ -269,17 +320,14 @@ class SmallCapPortfolioBacktester:
                 curr_c = SmallCapStrategyAnalyzer._to_float(row.get('close', 0.0))
                 current_atr = SmallCapStrategyAnalyzer._to_float(row.get('atr', 0.0))
                 rsi = SmallCapStrategyAnalyzer._to_float(row.get('rsi', 0.0))
-                vol_ratio = SmallCapStrategyAnalyzer._to_float(row.get('vol_ratio', 1.0))
                 
                 pos['days_held'] += 1
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
                 
-                # ブレークイーブン (1.5 ATR)
                 if curr_c >= pos['entry_p'] + (current_atr * 1.5):
                     pos['breakeven_active'] = True
 
-                # ハードストップ (退屈な銘柄なのでボラが少ない。2.0 ATRで十分)
                 atr_stop = pos['entry_p'] - (current_atr * 2.0)
                 hard_stop_price = min(atr_stop, pos['swing_low'] * 0.99)
                 
@@ -293,22 +341,17 @@ class SmallCapPortfolioBacktester:
                     else:
                         self.stats['hard_stops'] += 1 
                 
-                # 【イナゴ押し付けエグジット（真の利確）】
-                # 退屈な銘柄に突然「出来高3倍以上」の火柱が立ち、RSIが75を超えて過熱したら、
-                # イナゴ（一般個人）が群がってきた証拠。そこで大口と一緒に全株を売り抜ける！
-                if vol_ratio >= 3.0 and rsi >= 75.0 and exit_score == 0:
+                if rsi >= 85.0 and exit_score == 0:
                     exit_score += 100
-                    self.stats['inago_exits'] += 1
+                    self.stats['climax_exits'] += 1
 
-                # トレイリングストップ (トレンドを伸ばすため少し広めの 3.0 ATR)
                 trailing_stop_price = pos['high_p'] - (current_atr * 3.0)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                # タイムストップ（20日）
-                # 退屈な銘柄をジワジワ伸ばすため、ホールド期間は長めに許容する。1ヶ月経って含み益3%未満なら撤退。
-                if pos['days_held'] >= 20 and curr_c < (pos['entry_p'] * 1.03) and exit_score == 0: 
+                # 優良企業は育つまで時間がかかるためタイムストップを延長（15日）
+                if pos['days_held'] >= 15 and curr_c < (pos['entry_p'] * 1.03) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
 
@@ -326,7 +369,9 @@ class SmallCapPortfolioBacktester:
                 for ticker, row in today_market.items():
                     if ticker in positions: continue 
                     
-                    is_entry, score, is_high_risk = SmallCapStrategyAnalyzer.evaluate_entry(row, n_chg, vix)
+                    fund_data = self.fund_cache.get_fundamentals(ticker)
+                    is_entry, score, is_high_risk = SmallCapStrategyAnalyzer.evaluate_entry(row, n_chg, vix, fund_data)
+                    
                     if is_entry:
                         candidates.append((score, ticker))
                 
@@ -374,27 +419,38 @@ class SmallCapPortfolioBacktester:
 # 3. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity tests for Small Cap Logic...")
+    debug_log("Running integrity tests for Q-Mo Logic...")
     empty_df = pd.DataFrame()
     res_df = SmallCapStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    # ステルストレンド・テスト
+    # Q-Mo 正常系テスト
     dummy_row_ok = {
-        'close': 1050.0, 'ma50': 1000.0, 'ma200': 800.0,
-        'atr_pct': 3.5, 'vol_ratio': 0.8, 'rs_21': 5.0, 'dev25': 2.0,
+        'close': 1050.0, 'ma25': 1000.0, 'ma50': 950.0, 'ma200': 800.0,
+        'vol_ratio': 2.5, 'is_bullish': True, 'close_position': 0.8,
         'market_healthy': True
     }
+    dummy_fund_ok = {'roe': 12.0, 'equity_ratio': 55.0}
     try:
-        is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, 0.0, 15.0)
+        is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, 0.0, 15.0, dummy_fund_ok)
         assert isinstance(score, float)
-        assert is_entry is True, "Valid stealth trend row should return True"
+        assert is_entry is True, "Valid Q-Mo row should return True"
     except Exception as e:
         raise AssertionError(f"Failed handling valid data: {e}")
 
-    dummy_row_err = {'atr_pct': np.nan, 'vol_ratio': 'invalid', 'market_healthy': 'error'}
+    # ゾンビ企業排除テスト (ROE不足)
+    dummy_fund_bad = {'roe': 5.0, 'equity_ratio': 60.0}
     try:
-        is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_err, 0.0, 15.0)
+        is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, 0.0, 15.0, dummy_fund_bad)
+        assert is_entry is False, "Zombie company must be rejected"
+    except Exception as e:
+        raise AssertionError(f"Failed handling zombie data: {e}")
+
+    # 異常値テスト
+    dummy_row_err = {'ma200': np.nan, 'vol_ratio': 'invalid', 'market_healthy': 'error'}
+    dummy_fund_err = {'roe': None, 'equity_ratio': 'error'}
+    try:
+        is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_err, 0.0, 15.0, dummy_fund_err)
         assert isinstance(score, float)
         assert is_entry is False
     except Exception as e:
@@ -421,7 +477,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 SMALL CAP SIMULATION RESULTS (STEALTH TREND STRATEGY)")
+        print(f" 📊 SMALL CAP SIMULATION RESULTS (Q-Mo FUNDAMENTAL STRATEGY)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -437,11 +493,11 @@ if __name__ == "__main__":
         print(f" 🔬 小型株ロジック 分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
-        print(f" [3] イナゴ売り抜け(真の利確): {st['inago_exits']} 回 ★NEW")
-        print(f" [4] タイムストップ(20日)撤退: {st['time_stops']} 回")
-        print(f" [5] 建値ストップ(負け回避): {st['breakeven_stops']} 回")
-        print(f" [6] ハードストップ(安値割れ): {st['hard_stops']} 回")
-        print(f" [7] トレイリングストップ(3.0ATR): {st['trailing_stops']} 回")
+        print(f" [3] タイムストップ(15日)撤退: {st['time_stops']} 回")
+        print(f" [4] 建値ストップ(負け回避): {st['breakeven_stops']} 回")
+        print(f" [5] ハードストップ(安値割れ): {st['hard_stops']} 回")
+        print(f" [6] トレイリングストップ(3.0ATR): {st['trailing_stops']} 回")
+        print(f" [7] クライマックス売り(過熱極致): {st['climax_exits']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
