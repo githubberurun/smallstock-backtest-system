@@ -15,9 +15,10 @@ from datetime import datetime, timedelta
 BASE_URL: Final[str] = "https://api.jquants.com/v2"
 PRICES_ENDPOINT: Final[str] = "/equities/bars/daily"
 FINS_ENDPOINT: Final[str] = "/fins/summary"
+INFO_ENDPOINT: Final[str] = "/listed/info"
 
 class JQuantsV2Fetcher:
-    """J-Quants API v2準拠のデータ取得クラス（小型株対応）"""
+    """J-Quants API v2準拠のキャッシュ対応・小型株データ取得クラス"""
     def __init__(self, api_key: str) -> None:
         if not isinstance(api_key, str):
             raise TypeError("API key must be a string")
@@ -30,81 +31,100 @@ class JQuantsV2Fetcher:
         return safe_date.strftime("%Y-%m-%d")
 
     def get_top_small_cap_tickers(self, limit: int = 300, max_market_cap: float = 50_000_000_000.0) -> List[str]:
-        """売買代金上位銘柄の中から、時価総額が基準未満の小型株を抽出する"""
-        if not isinstance(limit, int) or limit <= 0:
-            raise ValueError("limit must be a positive integer")
-        if not isinstance(max_market_cap, float) or max_market_cap <= 0:
-            raise ValueError("max_market_cap must be a positive float")
-            
-        print("[INFO] Fetching daily quotes to sort by TurnoverValue...")
+        """売買代金上位銘柄の中から、小型株（500億未満）を効率的に抽出"""
+        print("[INFO] Step 1: Fetching master listed info to filter candidates...", flush=True)
+        try:
+            info_resp = requests.get(f"{BASE_URL}{INFO_ENDPOINT}", headers=self.headers, timeout=30)
+            if info_resp.status_code != 200:
+                print(f"[ERROR] Failed to fetch listed info: {info_resp.text}")
+                return []
+            info_df = pd.DataFrame(info_resp.json().get("data", []))
+        except Exception as e:
+            print(f"[ERROR] Exception in listed info fetch: {e}")
+            return []
+
+        # 1. 候補の絞り込み (プライム市場の大型株やREITなどはスキャンから除外して高速化)
+        small_cap_segments = ["Growth", "Standard", "グロース", "スタンダード"]
+        candidates_info = info_df[
+            (info_df["MarketCodeName"].str.contains("|".join(small_cap_segments), na=True)) &
+            (~info_df["SectorName"].str.contains("ETF|ETN|REIT", na=False))
+        ]
+        candidate_codes = set(candidates_info["Code"].tolist())
+        print(f"[INFO] Candidates filtered: {len(candidate_codes)} tickers from Growth/Standard segments.", flush=True)
+
+        print("[INFO] Step 2: Fetching daily quotes for all tickers...", flush=True)
         target_date = datetime.now().date()
         daily_quotes = []
-        
-        # 1. 直近の有効な取引日の全銘柄株価を取得
         for _ in range(10):
             params = {"date": target_date.strftime("%Y%m%d")}
-            try:
-                response = requests.get(f"{BASE_URL}{PRICES_ENDPOINT}", headers=self.headers, params=params, timeout=30)
-                if response.status_code == 200:
-                    res_json = response.json()
-                    # V2仕様: data または daily_quotes キーの両方に対応
-                    data = res_json.get("data", res_json.get("daily_quotes", []))
-                    if len(data) > 500:
-                        daily_quotes = data
-                        break
-            except Exception as e:
-                print(f"[WARN] Failed to fetch daily data for {target_date}: {e}")
+            response = requests.get(f"{BASE_URL}{PRICES_ENDPOINT}", headers=self.headers, params=params, timeout=30)
+            if response.status_code == 200:
+                data = response.json().get("data", [])
+                if len(data) > 500:
+                    daily_quotes = data
+                    break
             target_date -= timedelta(days=1)
             time.sleep(1)
-            
+
         if not daily_quotes:
             print("[ERROR] Could not fetch recent market data.")
             return []
 
-        # 2. 売買代金で降順ソート
-        df = pd.DataFrame(daily_quotes)
-        # V2ではカラム名が略称（Va, Cなど）に変更されているケースに対応
-        df['TurnoverValue_calc'] = pd.to_numeric(df.get('Va', df.get('TurnoverValue', 0)), errors='coerce')
-        df['Close_calc'] = pd.to_numeric(df.get('C', df.get('Close', 0)), errors='coerce')
-        df = df.sort_values('TurnoverValue_calc', ascending=False)
-        
+        # 2. 売買代金でソート
+        df_quotes = pd.DataFrame(daily_quotes)
+        df_quotes["Va_n"] = pd.to_numeric(df_quotes.get("Va", 0), errors="coerce")
+        df_quotes["C_n"] = pd.to_numeric(df_quotes.get("C", 0), errors="coerce")
+        df_quotes = df_quotes.sort_values("Va_n", ascending=False)
+
         target_tickers: List[str] = []
-        print(f"[INFO] Scanning for small caps (Market Cap < {max_market_cap/1_000_000_000:.1f}B JPY)...")
+        scan_limit = 1000
+        processed_count = 0
         
-        # 3. 上位から順に時価総額を計算し、小型株を抽出
-        for _, row in df.iterrows():
-            code = str(row.get('Code', ''))
-            if not code:
+        print(f"[INFO] Step 3: Verifying Market Cap for top {scan_limit} turnover candidates...", flush=True)
+        for _, row in df_quotes.iterrows():
+            code = str(row.get("Code", ""))
+            if code not in candidate_codes:
                 continue
-            close_price = float(row['Close_calc'])
-            if close_price <= 0: 
+            
+            processed_count += 1
+            if processed_count > scan_limit:
+                break
+
+            # ★ キャッシュ機能: すでにファイルが存在する銘柄は時価総額チェックAPIをスキップ
+            if os.path.exists(f"Colog_github/{code[:4]}.parquet"):
+                target_tickers.append(code[:4])
+                print(f"  [{len(target_tickers)}/{limit}] Cached Small Cap Loaded: {code[:4]}", flush=True)
+                if len(target_tickers) >= limit:
+                    break
                 continue
-                
-            f_params = {"code": code}
+
+            close_p = float(row["C_n"])
+            if close_p <= 0: 
+                continue
+
+            # 財務情報を取得して時価総額を確認
             try:
-                f_resp = requests.get(f"{BASE_URL}{FINS_ENDPOINT}", headers=self.headers, params=f_params, timeout=10)
+                f_resp = requests.get(f"{BASE_URL}{FINS_ENDPOINT}", headers=self.headers, params={"code": code}, timeout=10)
+                if f_resp.status_code == 429:
+                    print("[WARN] Rate limit hit. Sleeping 10s...", flush=True)
+                    time.sleep(10)
+                    f_resp = requests.get(f"{BASE_URL}{FINS_ENDPOINT}", headers=self.headers, params={"code": code}, timeout=10)
+
                 if f_resp.status_code == 200:
-                    f_json = f_resp.json()
-                    # fins/summary は data や statements の配列を返す
-                    f_data = f_json.get("data", f_json.get("statements", []))
+                    f_data = f_resp.json().get("data", [])
                     if f_data:
-                        # 最新の財務諸表から期末発行済株式数を取得
-                        latest_statement = f_data[-1]
-                        shares_str = latest_statement.get("NumberOfIssuedAndOutstandingSharesAtTheEndOfPeriod", "0")
-                        shares = float(shares_str) if shares_str and str(shares_str).strip() != "" else 0.0
-                        
-                        market_cap = close_price * shares
-                        
-                        if 0 < market_cap < max_market_cap:
+                        shares = float(f_data[-1].get("NumberOfIssuedAndOutstandingSharesAtTheEndOfPeriod", 0))
+                        mkt_cap = close_p * shares
+                        if 0 < mkt_cap < max_market_cap:
                             target_tickers.append(code[:4])
-                            print(f"  [+] Small Cap Found: {code[:4]} (Market Cap: {market_cap/1_000_000_000:.1f}B JPY)")
+                            print(f"  [{len(target_tickers)}/{limit}] Found: {code[:4]} | Cap: {mkt_cap/1e8:.1f}億 | Va: {row['Va_n']/1e6:.1f}M", flush=True)
                             if len(target_tickers) >= limit:
                                 break
             except Exception as e:
-                print(f"[WARN] Failed to fetch financials for {code}: {e}")
-                
-            time.sleep(0.3) # APIのレートリミット保護 (Lightプラン 60回/分 に配慮)
+                pass
             
+            time.sleep(0.3)
+
         return target_tickers
 
     def fetch(self, ticker: str) -> pd.DataFrame:
@@ -132,7 +152,6 @@ class JQuantsV2Fetcher:
                 return pd.DataFrame()
 
             res_json = response.json()
-            # data または daily_quotes キーから取得
             quotes = res_json.get("data", res_json.get("daily_quotes", []))
             all_data.extend(quotes)
 
@@ -149,7 +168,6 @@ class JQuantsV2Fetcher:
         if df.empty: 
             return df
             
-        # V2の略称(C, Va等)とV1の旧称(Close, TurnoverValue等)の双方に安全にマッピング
         col_map = {
             'Date': 'date', 
             'AdjClose': 'close', 'AdjC': 'close', 'AdjustmentClose': 'close',
@@ -195,7 +213,6 @@ def test_integrity() -> None:
     print("[TEST] Running integrity tests for data_fetcher.py...")
     dummy_fetcher = JQuantsV2Fetcher("dummy_key")
     
-    # 略称V2と従来V1の混在テスト
     df_mock = pd.DataFrame({
         'Date': ['2026-01-01'], 'AdjC': [150.5], 'AdjH': [155.0], 
         'AdjL': [149.0], 'AdjO': [150.0], 'AdjVo': [5000], 'Va': [752500]
@@ -229,16 +246,23 @@ if __name__ == "__main__":
     os.makedirs("Colog_github", exist_ok=True)
     
     target_tickers = fetcher.get_top_small_cap_tickers(limit=300, max_market_cap=50_000_000_000.0)
-    if "13060" not in target_tickers:
+    if "13060" not in target_tickers and "1306" not in target_tickers:
         target_tickers.append("13060") # TOPIX ETF (ベンチマーク用)
         
-    print(f"[INFO] Starting data fetch for {len(target_tickers)} tickers...")
+    print(f"[INFO] Starting data fetch for {len(target_tickers)} tickers...", flush=True)
     
     for i, target_ticker in enumerate(target_tickers):
-        print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}...", end=" ")
+        path = f"Colog_github/{target_ticker}.parquet"
+        
+        # ★ キャッシュ機能: すでにファイルが存在する場合は取得APIをスキップ
+        if os.path.exists(path):
+            print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}... CACHED (SKIP)", flush=True)
+            continue
+            
+        print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}...", end=" ", flush=True)
         fetched_data = fetcher.fetch(target_ticker)
         if not fetched_data.empty:
-            fetched_data.to_parquet(f"Colog_github/{target_ticker}.parquet", index=False)
-            print(f"OK ({len(fetched_data)} rows)")
+            fetched_data.to_parquet(path, index=False)
+            print(f"OK ({len(fetched_data)} rows)", flush=True)
         else:
-            print("FAILED")
+            print("FAILED", flush=True)
