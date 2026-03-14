@@ -1,15 +1,20 @@
 name: Weekly Backtest System
 
 on:
-  workflow_dispatch:      # 手動実行可能
+  push:
+    branches: [ "main" ] # push時にも動くようにして動作確認しやすくします
+  workflow_dispatch:      # 手動実行ボタンも残します
 
 env:
-  # Node.js 20の非推奨警告への対応 (Node.js 24への強制移行フラグ)
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Node.js 20の非推奨警告への対応 (2025-2026年推奨設定)
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   run-system:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 成果物をリポジトリに書き戻す必要がある場合に備え
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -18,33 +23,34 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip' # キャッシュを有効化して高速化
         
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas pyarrow fastparquet numpy yfinance
+          pip install requests pandas pyarrow fastparquet numpy yfinance jquants-api-client
 
       - name: Execute Pipeline
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-          # Pythonの標準出力をバッファリングせず即座にログへ書き出す設定
           PYTHONUNBUFFERED: "1"
         run: |
-          # JQUANTS_API_KEYが設定されていない場合はパイプラインを停止
+          # フォルダ作成（存在しない場合のエラー防止）
+          mkdir -p data
+          
           if [ -z "$JQUANTS_API_KEY" ]; then
-            echo "Error: JQUANTS_API_KEY is not set in secrets."
+            echo "Error: JQUANTS_API_KEY is not set in GitHub Secrets."
             exit 1
           fi
           
-          # 1. データ取得 (対象銘柄 & ベンチマーク) & 内部テスト
-          # -u フラグでバッファリングを無効化し、リアルタイムでログを表示
+          # 1. データ取得
           python -u data_fetcher.py
           
           # 2. 統合バックテスト実行
           python -u backtest_runner.py
 
       - name: Upload Results
-        if: always() # エラーが起きても可能な限り結果をアップロード
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results
