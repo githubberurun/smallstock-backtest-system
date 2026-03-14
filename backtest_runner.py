@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 # ==========================================
 
 def debug_log(msg: str) -> None:
-    """内部デバッグ用のロギング関数。引数の型チェックを含む。"""
+    """内部デバッグ用のロギング関数"""
     if not isinstance(msg, str): 
         msg = str(msg)
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -38,16 +38,21 @@ class JQuantsV2Client:
         
         # V2仕様: x-api-keyヘッダにAPIキーを直接指定（トークン発行は廃止）
         headers = {"x-api-key": self.api_key}
-        
-        # V2財務情報エンドポイント
         url = f"{self.base_url}/fins/summary?code={ticker}"
         
         try:
             res = requests.get(url, headers=headers, timeout=15)
             res.raise_for_status()
             
-            # V2仕様: レスポンスは "data" キーの配列として返却される
-            data = res.json().get("data", [])
+            resp_json = res.json()
+            data = []
+            
+            # V2仕様: "data" や "info" 等のリスト型キーを動的に探索して取得する堅牢な実装
+            for val in resp_json.values():
+                if isinstance(val, list):
+                    data = val
+                    break
+            
             if not data:
                 return {}
             
@@ -60,7 +65,7 @@ class JQuantsV2Client:
             return {}
 
 # ==========================================
-# ファンダメンタルズ・キャッシュマネージャー（自動修復版）
+# ファンダメンタルズ・キャッシュマネージャー（完全浄化＆フォールバック版）
 # ==========================================
 class FundamentalCache:
     """J-Quantsからの情報取得負荷を下げるためのローカルキャッシュ"""
@@ -84,11 +89,16 @@ class FundamentalCache:
     def get_fundamentals(self, ticker: str) -> Dict[str, float]:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
-        # 【自動修復ロジック】キャッシュが存在しない、または前回のエラーで 0.0 の場合は再取得
+        roe_val = self.data.get(ticker, {}).get('roe', 0.0)
+        eq_val = self.data.get(ticker, {}).get('equity_ratio', 0.0)
+        
+        # 【完全浄化ロジック】過去の異常値 (-999.0, 0.0) がキャッシュにあれば強制再取得
         needs_fetch = False
         if ticker not in self.data:
             needs_fetch = True
-        elif self.data[ticker].get('roe', 0.0) == 0.0 and self.data[ticker].get('equity_ratio', 0.0) == 0.0:
+        elif roe_val in [0.0, -999.0] and eq_val in [0.0, -999.0]:
+            needs_fetch = True
+        elif roe_val == -999.0 or eq_val == -999.0:
             needs_fetch = True
             
         if needs_fetch:
@@ -96,28 +106,37 @@ class FundamentalCache:
             try:
                 stmt = self.jq_client.get_statements(ticker)
                 
-                # J-Quantsのキーに合わせて取得 (Profit: 純利益, Equity: 自己資本, TotalAssets: 総資産)
-                equity_raw = stmt.get("Equity") or stmt.get("equity")
+                # キーの変動に備えた堅牢なパース
+                equity_raw = stmt.get("Equity") or stmt.get("equity") or stmt.get("NetAssets")
                 assets_raw = stmt.get("TotalAssets") or stmt.get("total_assets")
-                income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("profit")
+                income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("profit") or stmt.get("OperatingProfit")
                 
-                # Noneや空文字に対する堅牢なパース
                 equity = float(equity_raw) if equity_raw else 0.0
                 total_assets = float(assets_raw) if assets_raw else 0.0
                 net_income = float(income_raw) if income_raw else 0.0
                 
-                # 自己資本比率 (%) = 自己資本 / 総資産 * 100
-                equity_ratio = (equity / total_assets * 100.0) if total_assets > 0 else 0.0
-                
-                # ROE (%) = 当期純利益 / 自己資本 * 100
-                roe = (net_income / equity * 100.0) if equity > 0 else 0.0
-                
+                if total_assets > 0 and equity > 0:
+                    equity_ratio = (equity / total_assets * 100.0)
+                    roe = (net_income / equity * 100.0)
+                else:
+                    # 【究極の防衛線】J-Quantsがデータ欠損していた場合、yfinanceへ自動フォールバック
+                    debug_log(f"J-Quants parsed 0.0 for {ticker}, falling back to yfinance...")
+                    yf_ticker = f"{ticker}.T" if ticker.isdigit() else ticker
+                    info = yf.Ticker(yf_ticker).info
+                    
+                    r_raw = info.get('returnOnEquity', 0.0)
+                    roe = float(r_raw) * 100 if r_raw is not None else 0.0
+                    
+                    d_raw = info.get('debtToEquity', 0.0)
+                    dte = float(d_raw) if d_raw is not None else 0.0
+                    equity_ratio = 100.0 / (1.0 + (dte / 100.0)) if dte else 0.0
+                    
                 self.data[ticker] = {'roe': roe, 'equity_ratio': equity_ratio}
             except Exception as e:
                 debug_log(f"Error calculating fundamental for {ticker}: {e}")
                 self.data[ticker] = {'roe': 0.0, 'equity_ratio': 0.0} 
             
-            # API制限回避・データ永続化のため、1件ごとに保存
+            # 1件ごとにキャッシュを上書き保存
             try:
                 with open(self.filepath, 'w', encoding='utf-8') as f:
                     json.dump(self.data, f, ensure_ascii=False, indent=2)
@@ -308,6 +327,7 @@ class SmallCapPortfolioBacktester:
             df = SmallCapStrategyAnalyzer.calculate_indicators(df, bm_df)
             if df.empty: continue
             
+            # ここで必ずキャッシュから取得し、異常値なら再フェッチされる
             self.fund_cache.get_fundamentals(ticker)
             
             df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
@@ -514,8 +534,8 @@ if __name__ == "__main__":
     run_integrity_tests()
     
     if not JQ_API_KEY:
-        print("\n[ERROR] J-Quants v2 APIキーが環境変数 'JQUANTS_API_KEY' にセットされていません。")
-        print("GitHub Secretsの設定、またはローカルの環境変数を確認して再試行してください。")
+        print("\n[ERROR] J-Quants APIキーが環境変数 'JQUANTS_API_KEY' にセットされていません。")
+        print("GitHub Secretsの設定を確認してください。")
         exit(1)
         
     try:
