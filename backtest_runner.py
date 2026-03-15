@@ -22,7 +22,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. J-Quants API v2 クライアント (公式 x-api-key 仕様)
+# 1. J-Quants API v2 クライアント (5桁コード完全対応版)
 # ==========================================
 class JQuantsV2Client:
     """JPX公式 J-Quants API v2 クライアント"""
@@ -32,54 +32,83 @@ class JQuantsV2Client:
         
         self.api_key: str = api_key
         self.base_url: str = "https://api.jquants.com/v2" 
+        
+        # サーキットブレーカー用フラグ
+        self.is_api_broken: bool = False
+        self.consecutive_403_count: int = 0
 
     def get_statements(self, ticker: str) -> Dict[str, Any]:
-        """最新の財務諸表を取得する"""
+        """最新の財務諸表を取得する（5桁コード変換・WAF回避実装）"""
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
-        # V2仕様に則った正しい認証ヘッダー
-        headers = {"x-api-key": self.api_key}
+        # 5回連続で403エラーを引いた場合、APIキー自体が無効とみなし即時リターン（yfinanceへ直行）
+        if self.is_api_broken:
+            return {}
+            
+        # 【重要】V2仕様: 銘柄コードは原則5桁（末尾に0を付与）
+        # 例: "2321" -> "23210", "219A" -> "219A0"
+        code = f"{ticker}0" if len(ticker) == 4 else ticker
+        
+        headers = {
+            "x-api-key": self.api_key,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
         
         endpoints = [
-            f"{self.base_url}/fins/statements?code={ticker}",
-            f"{self.base_url}/fins/summary?code={ticker}"
+            f"{self.base_url}/fins/statements?code={code}",
+            f"{self.base_url}/fins/summary?code={code}"
         ]
         
         for url in endpoints:
             for attempt in range(2):
                 try:
-                    # スタンダードプランのWAFバースト制限回避
                     time.sleep(0.6) 
                     
                     res = requests.get(url, headers=headers, timeout=10)
                     
                     if res.status_code == 404:
-                        break # エンドポイントが存在しない/銘柄がない場合は次へ
+                        break # エンドポイントが存在しない、または該当銘柄がない場合は次へ
                         
-                    # 403や429が出た場合はWAF/レートリミットを疑い待機してリトライ
-                    if res.status_code in (403, 429):
-                        debug_log(f"HTTP {res.status_code}. Rate limit/WAF throttling suspected. Sleeping for 3s...")
-                        time.sleep(3.0)
+                    if res.status_code in (401, 403):
+                        debug_log(f"HTTP {res.status_code} for {code}. Response: {res.text}")
+                        self.consecutive_403_count += 1
+                        
+                        # 403が5回連続したらAPIキー設定ミスやBANと判断しサーキットブレーカーを発動
+                        if self.consecutive_403_count >= 5:
+                            debug_log("CRITICAL: API Key rejected 5 times consecutively. Tripping circuit breaker. Bypassing J-Quants.")
+                            self.is_api_broken = True
+                            return {}
+                            
+                        time.sleep(2.0)
                         if attempt == 0:
                             continue
                         else:
                             res.raise_for_status()
                             
+                    elif res.status_code == 429:
+                        debug_log(f"HTTP 429 Rate Limit. Sleeping 5s...")
+                        time.sleep(5.0)
+                        if attempt == 0:
+                            continue
+                        else:
+                            res.raise_for_status()
+
                     res.raise_for_status()
                     
+                    # 成功した場合は連続エラーカウントをリセット
+                    self.consecutive_403_count = 0
+                    
                     resp_json = res.json()
-                    # V2におけるキー構造の揺らぎを吸収
                     data = resp_json.get("statements") or resp_json.get("data") or resp_json.get("info") or []
                     
                     if not data:
                         return {}
                     
-                    # 最新の日付データを取得
                     data.sort(key=lambda x: str(x.get("DisclosedDate") or x.get("Date") or ""))
                     return data[-1]
                     
                 except Exception as e:
-                    if "403" not in str(e) and "429" not in str(e):
+                    if "401" not in str(e) and "403" not in str(e) and "429" not in str(e):
                         debug_log(f"J-Quants URL({url}) Error: {e}")
                         break
                     elif attempt == 1:
@@ -88,7 +117,7 @@ class JQuantsV2Client:
         return {}
 
 # ==========================================
-# 2. ファンダメンタルズ・キャッシュマネージャー（完全浄化・自動修復・ネガティブキャッシュ版）
+# 2. ファンダメンタルズ・キャッシュマネージャー
 # ==========================================
 class FundamentalCache:
     """J-Quantsからの情報取得負荷を下げるためのローカルキャッシュ"""
@@ -132,7 +161,6 @@ class FundamentalCache:
     def get_fundamentals(self, ticker: str) -> Dict[str, float]:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
-        # すでにキャッシュに存在し、"failed" の場合は即座にゼロを返す（再取得による遅延防止）
         if ticker in self.data:
             if self.data[ticker].get('status') == 'failed':
                 return {'roe': 0.0, 'equity_ratio': 0.0}
@@ -152,13 +180,12 @@ class FundamentalCache:
             if not stmt:
                 raise ValueError("No data returned from J-Quants")
             
-            # V2のキー名変更（短縮形など）を広くカバー
-            assets_raw = stmt.get("TotalAssets") or stmt.get("TotAssets") or stmt.get("TotalAsset") or stmt.get("Assets") or stmt.get("TA")
-            equity_raw = stmt.get("Equity") or stmt.get("NetAssets") or stmt.get("Eq") or stmt.get("Eqty")
-            income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("OperatingProfit") or stmt.get("Inc") or stmt.get("NetInc")
+            assets_raw = stmt.get("TotalAssets") or stmt.get("TotAssets") or stmt.get("TotalAsset") or stmt.get("Assets")
+            equity_raw = stmt.get("Equity") or stmt.get("NetAssets") or stmt.get("Eq")
+            income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("OperatingProfit")
             
             if assets_raw is None or equity_raw is None:
-                raise ValueError(f"Target keys missing in J-Quants response: {list(stmt.keys())}")
+                raise ValueError(f"Target keys missing in J-Quants response")
                 
             equity = float(equity_raw)
             total_assets = float(assets_raw)
@@ -171,10 +198,7 @@ class FundamentalCache:
         except Exception as e:
             debug_log(f"J-Quants failed for {ticker} ({e}). Falling back to yfinance...")
             try:
-                # 219A のような英字混じり銘柄にも確実に .T を付与してアクセス
                 yf_ticker = f"{ticker}.T"
-                # ※yfinance側で404（該当なし）が出た場合、内部のログとして標準出力されることがありますが、
-                # プログラム自体はここで安全に except へ移行します。
                 info = yf.Ticker(yf_ticker).info
                 
                 r_raw = info.get('returnOnEquity', 0.0)
@@ -185,10 +209,9 @@ class FundamentalCache:
                 equity_ratio = 100.0 / (1.0 + (dte / 100.0)) if dte else 0.0
                 success = True if (roe != 0.0 or equity_ratio != 0.0) else False
             except Exception as ye:
-                debug_log(f"yfinance fallback also failed for {ticker}: (Handled safely)")
+                debug_log(f"yfinance fallback also failed for {ticker}. Handled safely.")
                 roe, equity_ratio = 0.0, 0.0
                 
-        # 成功・失敗にかかわらず記録し、無限リトライを防ぐ
         self.data[ticker] = {
             'roe': roe, 
             'equity_ratio': equity_ratio,
