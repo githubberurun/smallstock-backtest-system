@@ -22,7 +22,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. J-Quants API v2 クライアント (5桁コード完全対応版)
+# 1. J-Quants API v2 クライアント (V2公式仕様完全対応)
 # ==========================================
 class JQuantsV2Client:
     """JPX公式 J-Quants API v2 クライアント"""
@@ -33,86 +33,71 @@ class JQuantsV2Client:
         self.api_key: str = api_key
         self.base_url: str = "https://api.jquants.com/v2" 
         
-        # サーキットブレーカー用フラグ
         self.is_api_broken: bool = False
         self.consecutive_403_count: int = 0
 
     def get_statements(self, ticker: str) -> Dict[str, Any]:
-        """最新の財務諸表を取得する（5桁コード変換・WAF回避実装）"""
+        """最新の財務情報を取得する（エンドポイント '/fins/summary' を使用）"""
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
-        
-        # 5回連続で403エラーを引いた場合、APIキー自体が無効とみなし即時リターン（yfinanceへ直行）
-        if self.is_api_broken:
-            return {}
+        if self.is_api_broken: return {}
             
-        # 【重要】V2仕様: 銘柄コードは原則5桁（末尾に0を付与）
-        # 例: "2321" -> "23210", "219A" -> "219A0"
-        code = f"{ticker}0" if len(ticker) == 4 else ticker
-        
         headers = {
             "x-api-key": self.api_key,
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         
-        endpoints = [
-            f"{self.base_url}/fins/statements?code={code}",
-            f"{self.base_url}/fins/summary?code={code}"
-        ]
+        # 【重要】V1の '/fins/statements' は廃止。V2の正式なエンドポイントは '/fins/summary'
+        url = f"{self.base_url}/fins/summary?code={ticker}"
         
-        for url in endpoints:
-            for attempt in range(2):
-                try:
-                    time.sleep(0.6) 
+        for attempt in range(2):
+            try:
+                time.sleep(0.6) 
+                
+                res = requests.get(url, headers=headers, timeout=10)
+                
+                if res.status_code == 404:
+                    return {} # 銘柄データが存在しない場合は空を返す
                     
-                    res = requests.get(url, headers=headers, timeout=10)
+                if res.status_code in (401, 403):
+                    debug_log(f"HTTP {res.status_code} for {ticker}. Response: {res.text}")
+                    self.consecutive_403_count += 1
                     
-                    if res.status_code == 404:
-                        break # エンドポイントが存在しない、または該当銘柄がない場合は次へ
-                        
-                    if res.status_code in (401, 403):
-                        debug_log(f"HTTP {res.status_code} for {code}. Response: {res.text}")
-                        self.consecutive_403_count += 1
-                        
-                        # 403が5回連続したらAPIキー設定ミスやBANと判断しサーキットブレーカーを発動
-                        if self.consecutive_403_count >= 5:
-                            debug_log("CRITICAL: API Key rejected 5 times consecutively. Tripping circuit breaker. Bypassing J-Quants.")
-                            self.is_api_broken = True
-                            return {}
-                            
-                        time.sleep(2.0)
-                        if attempt == 0:
-                            continue
-                        else:
-                            res.raise_for_status()
-                            
-                    elif res.status_code == 429:
-                        debug_log(f"HTTP 429 Rate Limit. Sleeping 5s...")
-                        time.sleep(5.0)
-                        if attempt == 0:
-                            continue
-                        else:
-                            res.raise_for_status()
-
-                    res.raise_for_status()
-                    
-                    # 成功した場合は連続エラーカウントをリセット
-                    self.consecutive_403_count = 0
-                    
-                    resp_json = res.json()
-                    data = resp_json.get("statements") or resp_json.get("data") or resp_json.get("info") or []
-                    
-                    if not data:
+                    if self.consecutive_403_count >= 5:
+                        debug_log("CRITICAL: API Key rejected 5 times. Tripping circuit breaker. Bypassing J-Quants.")
+                        self.is_api_broken = True
                         return {}
-                    
-                    data.sort(key=lambda x: str(x.get("DisclosedDate") or x.get("Date") or ""))
-                    return data[-1]
-                    
-                except Exception as e:
-                    if "401" not in str(e) and "403" not in str(e) and "429" not in str(e):
-                        debug_log(f"J-Quants URL({url}) Error: {e}")
-                        break
-                    elif attempt == 1:
-                        debug_log(f"J-Quants URL({url}) Error after retry: {e}")
+                        
+                    time.sleep(2.0)
+                    if attempt == 0: continue
+                    else: res.raise_for_status()
+                        
+                elif res.status_code == 429:
+                    debug_log(f"HTTP 429 Rate Limit. Sleeping 5s...")
+                    time.sleep(5.0)
+                    if attempt == 0: continue
+                    else: res.raise_for_status()
+
+                res.raise_for_status()
+                
+                self.consecutive_403_count = 0
+                
+                resp_json = res.json()
+                # V2仕様でのキー構造揺らぎを吸収
+                data = resp_json.get("summary") or resp_json.get("data") or resp_json.get("info") or resp_json.get("statements") or []
+                
+                if not data:
+                    return {}
+                
+                # 開示日等でソートして最新を取得
+                data.sort(key=lambda x: str(x.get("DisclosedDate") or x.get("Date") or ""))
+                return data[-1]
+                
+            except Exception as e:
+                if "401" not in str(e) and "403" not in str(e) and "429" not in str(e):
+                    debug_log(f"J-Quants URL({url}) Error: {e}")
+                    break
+                elif attempt == 1:
+                    debug_log(f"J-Quants URL({url}) Error after retry: {e}")
                 
         return {}
 
@@ -182,7 +167,7 @@ class FundamentalCache:
             
             assets_raw = stmt.get("TotalAssets") or stmt.get("TotAssets") or stmt.get("TotalAsset") or stmt.get("Assets")
             equity_raw = stmt.get("Equity") or stmt.get("NetAssets") or stmt.get("Eq")
-            income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("OperatingProfit")
+            income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("OperatingProfit") or stmt.get("NetInc")
             
             if assets_raw is None or equity_raw is None:
                 raise ValueError(f"Target keys missing in J-Quants response")
