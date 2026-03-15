@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 # 2025-2026年 最新公式ドキュメント準拠
 # Pandas: https://pandas.pydata.org/docs/
 # yfinance: https://yfinance.readthedocs.io/en/latest/
-# J-Quants API v2: https://jpx-jquants.com/api/
+# J-Quants V1->V2 移行仕様: https://jpx-jquants.com/spec/migration-v1-v2
 # ==========================================
 
 def debug_log(msg: str) -> None:
@@ -22,20 +22,22 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. J-Quants API v2 クライアント (APIキー直接指定方式・スリープ制御付き)
+# 1. J-Quants API v2 クライアント (公式 x-api-key 仕様)
 # ==========================================
 class JQuantsV2Client:
     """JPX公式 J-Quants API v2 クライアント"""
     def __init__(self, api_key: str):
         if not isinstance(api_key, str): raise TypeError("api_key must be string")
         if not api_key: raise ValueError("API Key is required")
+        
         self.api_key: str = api_key
         self.base_url: str = "https://api.jquants.com/v2" 
 
     def get_statements(self, ticker: str) -> Dict[str, Any]:
-        """最新の財務諸表を取得する（エンドポイントの揺らぎとアクセス制限に対応）"""
+        """最新の財務諸表を取得する"""
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
+        # V2仕様に則った正しい認証ヘッダー
         headers = {"x-api-key": self.api_key}
         
         endpoints = [
@@ -44,40 +46,42 @@ class JQuantsV2Client:
         ]
         
         for url in endpoints:
-            for attempt in range(2): # 403等のためのリトライループ（最大2回）
+            for attempt in range(2):
                 try:
-                    # 【改善】ユーザー提案のインターバル制御。WAFのバースト制限（403）を回避
+                    # スタンダードプランのWAFバースト制限回避
                     time.sleep(0.6) 
                     
                     res = requests.get(url, headers=headers, timeout=10)
                     
                     if res.status_code == 404:
-                        break # 404の場合は再試行せず次のエンドポイントへ
+                        break # エンドポイントが存在しない/銘柄がない場合は次へ
                         
-                    # 403(Forbidden) または 429(Too Many Requests) の場合はアクセス過多による遮断を疑う
+                    # 403や429が出た場合はWAF/レートリミットを疑い待機してリトライ
                     if res.status_code in (403, 429):
-                        debug_log(f"HTTP {res.status_code} received. Rate limit/WAF throttling suspected. Sleeping for 3s...")
+                        debug_log(f"HTTP {res.status_code}. Rate limit/WAF throttling suspected. Sleeping for 3s...")
                         time.sleep(3.0)
                         if attempt == 0:
-                            continue # 1回目のエラーなら待機後に再試行
+                            continue
                         else:
-                            res.raise_for_status() # 2回目もダメなら例外を投げる
+                            res.raise_for_status()
                             
                     res.raise_for_status()
                     
                     resp_json = res.json()
-                    data = resp_json.get("statements") or resp_json.get("data") or []
+                    # V2におけるキー構造の揺らぎを吸収
+                    data = resp_json.get("statements") or resp_json.get("data") or resp_json.get("info") or []
                     
                     if not data:
                         return {}
                     
-                    data.sort(key=lambda x: str(x.get("DisclosedDate", "")))
+                    # 最新の日付データを取得
+                    data.sort(key=lambda x: str(x.get("DisclosedDate") or x.get("Date") or ""))
                     return data[-1]
                     
                 except Exception as e:
                     if "403" not in str(e) and "429" not in str(e):
                         debug_log(f"J-Quants URL({url}) Error: {e}")
-                        break # その他の通信エラーはリトライせず抜ける
+                        break
                     elif attempt == 1:
                         debug_log(f"J-Quants URL({url}) Error after retry: {e}")
                 
@@ -107,7 +111,6 @@ class FundamentalCache:
         return {}
 
     def _validate_and_repair_cache(self) -> None:
-        """キャッシュ内の異常値を検知し強制浄化する"""
         if not self.data: return
         valid_count = 0
         for d in self.data.values():
@@ -129,7 +132,7 @@ class FundamentalCache:
     def get_fundamentals(self, ticker: str) -> Dict[str, float]:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
-        # すでにキャッシュに存在し、かつ "failed" ステータスが記録されている場合は即座にゼロを返し、再取得を行わない
+        # すでにキャッシュに存在し、"failed" の場合は即座にゼロを返す（再取得による遅延防止）
         if ticker in self.data:
             if self.data[ticker].get('status') == 'failed':
                 return {'roe': 0.0, 'equity_ratio': 0.0}
@@ -149,12 +152,13 @@ class FundamentalCache:
             if not stmt:
                 raise ValueError("No data returned from J-Quants")
             
-            assets_raw = stmt.get("TotalAssets") or stmt.get("TotAssets") or stmt.get("TotalAsset")
-            equity_raw = stmt.get("Equity") or stmt.get("NetAssets") or stmt.get("Eq")
-            income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("OperatingProfit")
+            # V2のキー名変更（短縮形など）を広くカバー
+            assets_raw = stmt.get("TotalAssets") or stmt.get("TotAssets") or stmt.get("TotalAsset") or stmt.get("Assets") or stmt.get("TA")
+            equity_raw = stmt.get("Equity") or stmt.get("NetAssets") or stmt.get("Eq") or stmt.get("Eqty")
+            income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("OperatingProfit") or stmt.get("Inc") or stmt.get("NetInc")
             
             if assets_raw is None or equity_raw is None:
-                raise ValueError("Target keys missing in J-Quants response")
+                raise ValueError(f"Target keys missing in J-Quants response: {list(stmt.keys())}")
                 
             equity = float(equity_raw)
             total_assets = float(assets_raw)
@@ -167,7 +171,10 @@ class FundamentalCache:
         except Exception as e:
             debug_log(f"J-Quants failed for {ticker} ({e}). Falling back to yfinance...")
             try:
-                yf_ticker = f"{ticker}.T" if ticker.isdigit() else ticker
+                # 219A のような英字混じり銘柄にも確実に .T を付与してアクセス
+                yf_ticker = f"{ticker}.T"
+                # ※yfinance側で404（該当なし）が出た場合、内部のログとして標準出力されることがありますが、
+                # プログラム自体はここで安全に except へ移行します。
                 info = yf.Ticker(yf_ticker).info
                 
                 r_raw = info.get('returnOnEquity', 0.0)
@@ -178,10 +185,10 @@ class FundamentalCache:
                 equity_ratio = 100.0 / (1.0 + (dte / 100.0)) if dte else 0.0
                 success = True if (roe != 0.0 or equity_ratio != 0.0) else False
             except Exception as ye:
-                debug_log(f"yfinance fallback also failed for {ticker}: {ye}")
+                debug_log(f"yfinance fallback also failed for {ticker}: (Handled safely)")
                 roe, equity_ratio = 0.0, 0.0
                 
-        # 成功・失敗にかかわらず、結果とステータスをキャッシュに保存する
+        # 成功・失敗にかかわらず記録し、無限リトライを防ぐ
         self.data[ticker] = {
             'roe': roe, 
             'equity_ratio': equity_ratio,
@@ -291,7 +298,6 @@ class SmallCapStrategyAnalyzer:
         
         market_healthy = bool(row_dict.get('market_healthy', True))
         
-        # 【MDD改善1】 VIXの許容上限を25.0から22.0へ厳格化。荒れた相場でのエントリーを防ぐ
         if not market_healthy or vix >= 22.0:
             return False, 0.0, False
             
@@ -310,14 +316,12 @@ class SmallCapStrategyAnalyzer:
         is_bullish = bool(row_dict.get('is_bullish', False))
         close_pos = SmallCapStrategyAnalyzer._to_float(row_dict.get('close_position', 0.0))
         
-        # 【MDD改善2】 テクニカル指標の強化（モメンタム確認とボラティリティ排除）
         rsi = SmallCapStrategyAnalyzer._to_float(row_dict.get('rsi', 0.0))
         atr_pct = SmallCapStrategyAnalyzer._to_float(row_dict.get('atr_pct', 0.0))
 
         score = 0.0
         
         if curr_c > ma25_val and ma25_val > ma50_val and ma50_val > ma200_val:
-            # RSI50以上で上昇圧力を担保し、ATR10%以上のノイズ（仕手株）を弾く
             if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and rsi >= 50.0 and atr_pct < 10.0:
                 score += 100.0
                 
