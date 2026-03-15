@@ -51,7 +51,6 @@ class JQuantsV2Client:
         
         for attempt in range(2):
             try:
-                # WAFバースト制限回避
                 time.sleep(0.6) 
                 
                 res = requests.get(url, headers=headers, timeout=10)
@@ -89,13 +88,10 @@ class JQuantsV2Client:
                 
                 data.sort(key=lambda x: str(x.get("DiscDate") or x.get("DisclosedDate") or x.get("Date") or ""))
                 
-                # 【重要修正】財務データ（総資産・自己資本）が実際に含まれている最新の開示を逆順で探し出す
-                # これにより、業績予想の修正など「中身が空のIRニュース」を掴んでしまうエラーを排除
                 for stmt in reversed(data):
                     if ("TA" in stmt or "TotalAssets" in stmt) and ("Eq" in stmt or "Equity" in stmt):
                         return stmt
                         
-                # 財務データ入りが見つからない場合は仕方なく最新のものを返す（呼び出し側でフォールバック）
                 return data[-1]
                 
             except Exception as e:
@@ -132,8 +128,6 @@ class FundamentalCache:
     def get_fundamentals(self, ticker: str) -> Dict[str, float]:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
-        # 【重要修正】キャッシュに存在する場合は、その値（0.0であっても）を即座に返し、再取得を絶対に許可しない。
-        # これにより、バックテスト中の日付ループのたびにAPIを叩きに行く「無限ループ」を完全に阻止。
         if ticker in self.data:
             return {
                 'roe': float(self.data[ticker].get('roe', 0.0)),
@@ -149,7 +143,6 @@ class FundamentalCache:
             if not stmt:
                 raise ValueError("No data returned from J-Quants")
             
-            # V2仕様の短縮キーに完全対応
             assets_raw = stmt.get("TA") or stmt.get("TotalAssets")
             equity_raw = stmt.get("Eq") or stmt.get("Equity")
             income_raw = stmt.get("NP") or stmt.get("Profit") or stmt.get("OP")
@@ -182,7 +175,6 @@ class FundamentalCache:
                 debug_log(f"yfinance fallback also failed for {ticker}. Handled safely.")
                 roe, equity_ratio = 0.0, 0.0
                 
-        # 取得結果（失敗含む）を記録。次回からは確実にキャッシュを返す。
         self.data[ticker] = {
             'roe': roe, 
             'equity_ratio': equity_ratio,
@@ -316,7 +308,8 @@ class SmallCapStrategyAnalyzer:
         score = 0.0
         
         if curr_c > ma25_val and ma25_val > ma50_val and ma50_val > ma200_val:
-            if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and rsi >= 50.0 and atr_pct < 10.0:
+            # 【MDD改善】ダマシ回避のため、RSIの基準を55.0に引き上げ、ATRを8.0%未満に厳格化
+            if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and rsi >= 55.0 and atr_pct < 8.0:
                 score += 100.0
                 
         is_entry = (score >= 100.0) 
@@ -383,7 +376,6 @@ class SmallCapPortfolioBacktester:
             df = SmallCapStrategyAnalyzer.calculate_indicators(df, bm_df)
             if df.empty: continue
             
-            # 初期化時に一度だけファンダメンタルズを取得・キャッシュ構築
             self.fund_cache.get_fundamentals(ticker)
             
             df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
@@ -456,7 +448,8 @@ class SmallCapPortfolioBacktester:
                 if curr_c >= pos['entry_p'] + (current_atr * 1.5):
                     pos['breakeven_active'] = True
 
-                atr_stop = pos['entry_p'] - (current_atr * 2.0)
+                # 【MDD改善】ハードストップをATR2.0から1.5へタイト化（損切りを早くする）
+                atr_stop = pos['entry_p'] - (current_atr * 1.5)
                 hard_stop_price = min(atr_stop, pos['swing_low'] * 0.99)
                 
                 if pos['breakeven_active']:
@@ -473,12 +466,14 @@ class SmallCapPortfolioBacktester:
                     exit_score += 100
                     self.stats['climax_exits'] += 1
 
-                trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
+                # 【MDD改善】トレイリングストップをATR2.5から2.0へ引き下げ（利益を早めに確定）
+                trailing_stop_price = pos['high_p'] - (current_atr * 2.0)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                if pos['days_held'] >= 10 and curr_c < (pos['entry_p'] * 1.03) and exit_score == 0: 
+                # 【資金効率改善】タイムストップを10日から8日へ短縮し、見込みなしのポジションを素早く切る
+                if pos['days_held'] >= 8 and curr_c < (pos['entry_p'] * 1.02) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
 
@@ -496,7 +491,6 @@ class SmallCapPortfolioBacktester:
                 for ticker, row in today_market.items():
                     if ticker in positions: continue 
                     
-                    # 修正点：ここでキャッシュから確実に取得（APIへは行かない）
                     fund_data = self.fund_cache.get_fundamentals(ticker)
                     is_entry, score, is_high_risk = SmallCapStrategyAnalyzer.evaluate_entry(row, n_chg, vix, fund_data)
                     
@@ -557,7 +551,7 @@ def run_integrity_tests() -> None:
     dummy_row_ok = {
         'close': 1050.0, 'ma25': 1000.0, 'ma50': 950.0, 'ma200': 800.0,
         'vol_ratio': 2.5, 'is_bullish': True, 'close_position': 0.8,
-        'market_healthy': True, 'rsi': 55.0, 'atr_pct': 5.0
+        'market_healthy': True, 'rsi': 56.0, 'atr_pct': 7.0
     }
     dummy_fund_ok = {'roe': 12.0, 'equity_ratio': 55.0}
     try:
@@ -628,10 +622,10 @@ if __name__ == "__main__":
         print(f" 🔬 小型株ロジック 分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
-        print(f" [3] タイムストップ(10日)撤退: {st['time_stops']} 回")
+        print(f" [3] タイムストップ(8日)撤退: {st['time_stops']} 回")
         print(f" [4] 建値ストップ(負け回避): {st['breakeven_stops']} 回")
         print(f" [5] ハードストップ(安値割れ): {st['hard_stops']} 回")
-        print(f" [6] トレイリングストップ(2.5ATR): {st['trailing_stops']} 回")
+        print(f" [6] トレイリングストップ(2.0ATR): {st['trailing_stops']} 回")
         print(f" [7] クライマックス売り(過熱極致): {st['climax_exits']} 回")
         print(f"==================================================", flush=True)
         
