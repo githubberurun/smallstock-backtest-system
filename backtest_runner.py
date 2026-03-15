@@ -4,6 +4,7 @@ import os
 import json
 import requests
 import yfinance as yf
+import time
 from typing import Dict, List, Any, Optional, Tuple, Union
 from datetime import datetime, timedelta
 
@@ -21,7 +22,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. J-Quants API v2 クライアント (APIキー直接指定方式)
+# 1. J-Quants API v2 クライアント (APIキー直接指定方式・スリープ制御付き)
 # ==========================================
 class JQuantsV2Client:
     """JPX公式 J-Quants API v2 クライアント"""
@@ -32,35 +33,53 @@ class JQuantsV2Client:
         self.base_url: str = "https://api.jquants.com/v2" 
 
     def get_statements(self, ticker: str) -> Dict[str, Any]:
-        """最新の財務諸表を取得する（エンドポイントの揺らぎに対応）"""
+        """最新の財務諸表を取得する（エンドポイントの揺らぎとアクセス制限に対応）"""
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
         headers = {"x-api-key": self.api_key}
         
-        # V2仕様のエンドポイント（揺らぎを考慮して2パターン試行）
         endpoints = [
             f"{self.base_url}/fins/statements?code={ticker}",
             f"{self.base_url}/fins/summary?code={ticker}"
         ]
         
         for url in endpoints:
-            try:
-                res = requests.get(url, headers=headers, timeout=10)
-                if res.status_code == 404:
-                    continue 
-                res.raise_for_status()
-                
-                resp_json = res.json()
-                data = resp_json.get("statements") or resp_json.get("data") or []
-                
-                if not data:
-                    return {}
-                
-                data.sort(key=lambda x: str(x.get("DisclosedDate", "")))
-                return data[-1]
-                
-            except Exception as e:
-                debug_log(f"J-Quants URL({url}) Error: {e}")
+            for attempt in range(2): # 403等のためのリトライループ（最大2回）
+                try:
+                    # 【改善】ユーザー提案のインターバル制御。WAFのバースト制限（403）を回避
+                    time.sleep(0.6) 
+                    
+                    res = requests.get(url, headers=headers, timeout=10)
+                    
+                    if res.status_code == 404:
+                        break # 404の場合は再試行せず次のエンドポイントへ
+                        
+                    # 403(Forbidden) または 429(Too Many Requests) の場合はアクセス過多による遮断を疑う
+                    if res.status_code in (403, 429):
+                        debug_log(f"HTTP {res.status_code} received. Rate limit/WAF throttling suspected. Sleeping for 3s...")
+                        time.sleep(3.0)
+                        if attempt == 0:
+                            continue # 1回目のエラーなら待機後に再試行
+                        else:
+                            res.raise_for_status() # 2回目もダメなら例外を投げる
+                            
+                    res.raise_for_status()
+                    
+                    resp_json = res.json()
+                    data = resp_json.get("statements") or resp_json.get("data") or []
+                    
+                    if not data:
+                        return {}
+                    
+                    data.sort(key=lambda x: str(x.get("DisclosedDate", "")))
+                    return data[-1]
+                    
+                except Exception as e:
+                    if "403" not in str(e) and "429" not in str(e):
+                        debug_log(f"J-Quants URL({url}) Error: {e}")
+                        break # その他の通信エラーはリトライせず抜ける
+                    elif attempt == 1:
+                        debug_log(f"J-Quants URL({url}) Error after retry: {e}")
                 
         return {}
 
@@ -110,7 +129,7 @@ class FundamentalCache:
     def get_fundamentals(self, ticker: str) -> Dict[str, float]:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
-        # すでにキャッシュに存在し、かつ "failed" ステータスが記録されている場合は即座にゼロを返し、再取得を行わない（403ループ防止）
+        # すでにキャッシュに存在し、かつ "failed" ステータスが記録されている場合は即座にゼロを返し、再取得を行わない
         if ticker in self.data:
             if self.data[ticker].get('status') == 'failed':
                 return {'roe': 0.0, 'equity_ratio': 0.0}
@@ -118,7 +137,6 @@ class FundamentalCache:
             roe_val = self.data[ticker].get('roe', 0.0)
             eq_val = self.data[ticker].get('equity_ratio', 0.0)
             
-            # 正常に取得できているとみなす
             if roe_val not in [0.0, -999.0] and eq_val not in [0.0, -999.0]:
                 return {'roe': float(roe_val), 'equity_ratio': float(eq_val)}
 
@@ -163,7 +181,7 @@ class FundamentalCache:
                 debug_log(f"yfinance fallback also failed for {ticker}: {ye}")
                 roe, equity_ratio = 0.0, 0.0
                 
-        # 成功・失敗にかかわらず、結果とステータスをキャッシュに保存する（ネガティブキャッシュ）
+        # 成功・失敗にかかわらず、結果とステータスをキャッシュに保存する
         self.data[ticker] = {
             'roe': roe, 
             'equity_ratio': equity_ratio,
@@ -392,7 +410,6 @@ class SmallCapPortfolioBacktester:
             today_market = self.timeline[date_str]
             n_chg, vix = self.us_market.get_state(date_str)
             
-            # 当日の総資産を計算（ポジションサイジングに使用）
             current_total_equity = cash + sum([p['qty'] * SmallCapStrategyAnalyzer._to_float(today_market.get(t, {}).get('close', p['entry_p'])) for t, p in positions.items()])
             
             new_pending = []
@@ -457,13 +474,11 @@ class SmallCapPortfolioBacktester:
                     exit_score += 100
                     self.stats['climax_exits'] += 1
 
-                # 【MDD改善3】 トレイリングストップを 3.0ATR から 2.5ATR に引き締め、利益の急激な溶けを防ぐ
                 trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                # 【MDD改善4】 タイムストップを15日→10日に短縮し、機会損失を抑える
                 if pos['days_held'] >= 10 and curr_c < (pos['entry_p'] * 1.03) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
@@ -492,8 +507,6 @@ class SmallCapPortfolioBacktester:
                 allowed_slots_today = min(open_slots, self.max_positions)
                 
                 for score, ticker in candidates[:allowed_slots_today]:
-                    # 【MDD改善5】 リスク管理：1銘柄に投じる資金を「総資産の20%」を上限とする。
-                    # 全額突っ込むことによる、複利増加時の深刻なドローダウンを回避する。
                     max_alloc_per_trade = current_total_equity * (1.0 / self.max_positions)
                     target_alloc = min(cash / open_slots, max_alloc_per_trade)
                     
