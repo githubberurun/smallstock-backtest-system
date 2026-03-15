@@ -262,9 +262,9 @@ class SmallCapStrategyAnalyzer:
         
         if benchmark_df is not None and not benchmark_df.empty:
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
-            # 【MDD改善】相場環境フィルターの超厳格化。遅行する50日/200日線ではなく、25日/50日線の短期・中期パーフェクトオーダーを採用。
             benchmark_df['bm_ma25'] = benchmark_df['close'].rolling(window=25).mean()
             benchmark_df['bm_ma50'] = benchmark_df['close'].rolling(window=50).mean()
+            # 相場全体のトレンドフィルター（25日線 > 50日線）は維持
             benchmark_df['market_healthy'] = (benchmark_df['close'] > benchmark_df['bm_ma25']) & (benchmark_df['bm_ma25'] > benchmark_df['bm_ma50'])
             
             df = df.merge(benchmark_df[['date', 'market_healthy']], on='date', how='left')
@@ -286,7 +286,6 @@ class SmallCapStrategyAnalyzer:
         
         market_healthy = bool(row_dict.get('market_healthy', True))
         
-        # 【MDD改善】VIXの許容上限を22.0から20.0へさらに引き下げ、ボラティリティ相場での被弾を回避
         if not market_healthy or vix >= 20.0:
             return False, 0.0, False
             
@@ -312,11 +311,9 @@ class SmallCapStrategyAnalyzer:
         score = 0.0
         
         if curr_c > ma25_val and ma25_val > ma50_val and ma50_val > ma200_val:
-            # 【MDD改善】
-            # 1. RSI上限を75.0に設定し、高値掴み（イナゴタワーの頂点）を回避。
-            # 2. ボラティリティ(atr_pct)の下限を6.0%未満にし、仕手株を完全に排除。
-            # 3. 相対強度(rs_21)が0以上（市場平均に勝っている銘柄）のみをエントリー対象にする。
-            if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and (55.0 <= rsi <= 75.0) and atr_pct < 6.0 and rs_21 >= 0.0:
+            # 【リターン回復】RSI上限を80.0に緩和。ボラティリティ上限を8.0%に戻し、暴れ馬も許容。
+            # ただし、相対強度(rs_21 >= 0)の条件は維持し「弱小銘柄のダマシ」は防ぐ。
+            if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and (55.0 <= rsi <= 80.0) and atr_pct < 8.0 and rs_21 >= 0.0:
                 score += 100.0
                 
         is_entry = (score >= 100.0) 
@@ -455,8 +452,8 @@ class SmallCapPortfolioBacktester:
                 if curr_c >= pos['entry_p'] + (current_atr * 1.5):
                     pos['breakeven_active'] = True
 
-                # 【MDD改善】ハードストップをATR 1.5から 1.0 へ究極にタイト化。ダメなら即切る。
-                atr_stop = pos['entry_p'] - (current_atr * 1.0)
+                # 【リターン回復】ハードストップをATR 1.5へ緩和（多少のノイズは耐える）
+                atr_stop = pos['entry_p'] - (current_atr * 1.5)
                 hard_stop_price = min(atr_stop, pos['swing_low'] * 0.99)
                 
                 if pos['breakeven_active']:
@@ -473,14 +470,15 @@ class SmallCapPortfolioBacktester:
                     exit_score += 100
                     self.stats['climax_exits'] += 1
 
-                # 【MDD改善】トレイリングストップをATR 2.0から 1.5 へ引き下げ。利益が乗ったら逃さない。
-                trailing_stop_price = pos['high_p'] - (current_atr * 1.5)
+                # 【リターン回復】トレイリングストップをATR 2.5へ緩和（利益を大相場に育てる）
+                trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                # 【MDD改善】タイムストップを8日から「5日」へ極限まで短縮。資金拘束による被弾を回避。
-                if pos['days_held'] >= 5 and curr_c < (pos['entry_p'] * 1.02) and exit_score == 0: 
+                # 【リターン回復】タイムストップを8日に戻し、かつ「建値より下がっている場合のみ」切る。
+                # 8日経過しても少しでも含み益（1.01倍以上）があるなら、まだ育つと信じて握力強めにホールド。
+                if pos['days_held'] >= 8 and curr_c <= (pos['entry_p'] * 1.01) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
 
@@ -558,7 +556,7 @@ def run_integrity_tests() -> None:
     dummy_row_ok = {
         'close': 1050.0, 'ma25': 1000.0, 'ma50': 950.0, 'ma200': 800.0,
         'vol_ratio': 2.5, 'is_bullish': True, 'close_position': 0.8,
-        'market_healthy': True, 'rsi': 60.0, 'atr_pct': 5.0, 'rs_21': 2.0
+        'market_healthy': True, 'rsi': 70.0, 'atr_pct': 7.0, 'rs_21': 2.0
     }
     dummy_fund_ok = {'roe': 12.0, 'equity_ratio': 55.0}
     try:
@@ -629,10 +627,10 @@ if __name__ == "__main__":
         print(f" 🔬 小型株ロジック 分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
-        print(f" [3] タイムストップ(5日)撤退: {st['time_stops']} 回")
+        print(f" [3] タイムストップ(8日/含み損撤退): {st['time_stops']} 回")
         print(f" [4] 建値ストップ(負け回避): {st['breakeven_stops']} 回")
         print(f" [5] ハードストップ(安値割れ): {st['hard_stops']} 回")
-        print(f" [6] トレイリングストップ(1.5ATR): {st['trailing_stops']} 回")
+        print(f" [6] トレイリングストップ(2.5ATR): {st['trailing_stops']} 回")
         print(f" [7] クライマックス売り(過熱極致): {st['climax_exits']} 回")
         print(f"==================================================", flush=True)
         
