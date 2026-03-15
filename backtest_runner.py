@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 # 2025-2026年 最新公式ドキュメント準拠
 # Pandas: https://pandas.pydata.org/docs/
 # yfinance: https://yfinance.readthedocs.io/en/latest/
+# J-Quants V2 財務情報仕様: https://jpx-jquants.com/ja/spec/fin-summary
 # J-Quants V1->V2 移行仕様: https://jpx-jquants.com/spec/migration-v1-v2
 # ==========================================
 
@@ -46,17 +47,17 @@ class JQuantsV2Client:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         
-        # 【重要】V1の '/fins/statements' は廃止。V2の正式なエンドポイントは '/fins/summary'
         url = f"{self.base_url}/fins/summary?code={ticker}"
         
         for attempt in range(2):
             try:
+                # WAFバースト制限回避
                 time.sleep(0.6) 
                 
                 res = requests.get(url, headers=headers, timeout=10)
                 
                 if res.status_code == 404:
-                    return {} # 銘柄データが存在しない場合は空を返す
+                    return {} 
                     
                 if res.status_code in (401, 403):
                     debug_log(f"HTTP {res.status_code} for {ticker}. Response: {res.text}")
@@ -78,18 +79,16 @@ class JQuantsV2Client:
                     else: res.raise_for_status()
 
                 res.raise_for_status()
-                
                 self.consecutive_403_count = 0
                 
                 resp_json = res.json()
-                # V2仕様でのキー構造揺らぎを吸収
-                data = resp_json.get("summary") or resp_json.get("data") or resp_json.get("info") or resp_json.get("statements") or []
+                data = resp_json.get("summary") or resp_json.get("data") or resp_json.get("statements") or []
                 
                 if not data:
                     return {}
                 
-                # 開示日等でソートして最新を取得
-                data.sort(key=lambda x: str(x.get("DisclosedDate") or x.get("Date") or ""))
+                # 【修正】V2仕様における開示日キー「DiscDate」に対応
+                data.sort(key=lambda x: str(x.get("DiscDate") or x.get("DisclosedDate") or x.get("Date") or ""))
                 return data[-1]
                 
             except Exception as e:
@@ -125,23 +124,22 @@ class FundamentalCache:
         return {}
 
     def _validate_and_repair_cache(self) -> None:
+        """過去のバグで「failed」として記録されたキャッシュを強制破棄し再取得させる"""
         if not self.data: return
-        valid_count = 0
-        for d in self.data.values():
-            try:
-                if float(d.get('roe', 0.0)) >= 10.0 and float(d.get('equity_ratio', 0.0)) >= 50.0:
-                    valid_count += 1
-            except:
-                pass
+        
+        # 失敗記録を全て削除（これがないと永遠にyfinanceにフォールバックし続けます）
+        keys_to_delete = [k for k, v in self.data.items() if v.get('status') == 'failed']
+        for k in keys_to_delete:
+            del self.data[k]
+            
+        valid_count = sum(1 for d in self.data.values() if float(d.get('roe', 0.0)) >= 10.0 and float(d.get('equity_ratio', 0.0)) >= 50.0)
                 
         if valid_count == 0 and len(self.data) > 50:
-            debug_log("WARNING: Local cache has 0 valid companies. Format may be corrupted. Forcing cache clear...")
+            debug_log("WARNING: Local cache has 0 valid companies. Forcing cache clear...")
             self.data = {}
             if os.path.exists(self.filepath):
-                try:
-                    os.remove(self.filepath)
-                except:
-                    pass
+                try: os.remove(self.filepath)
+                except: pass
 
     def get_fundamentals(self, ticker: str) -> Dict[str, float]:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
@@ -165,12 +163,13 @@ class FundamentalCache:
             if not stmt:
                 raise ValueError("No data returned from J-Quants")
             
-            assets_raw = stmt.get("TotalAssets") or stmt.get("TotAssets") or stmt.get("TotalAsset") or stmt.get("Assets")
-            equity_raw = stmt.get("Equity") or stmt.get("NetAssets") or stmt.get("Eq")
-            income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("OperatingProfit") or stmt.get("NetInc")
+            # 【重要修正】V2仕様の短縮キーに完全対応（TA: 総資産, Eq: 自己資本, NP: 純利益）
+            assets_raw = stmt.get("TA") or stmt.get("TotalAssets")
+            equity_raw = stmt.get("Eq") or stmt.get("Equity")
+            income_raw = stmt.get("NP") or stmt.get("Profit") or stmt.get("OP")
             
             if assets_raw is None or equity_raw is None:
-                raise ValueError(f"Target keys missing in J-Quants response")
+                raise ValueError(f"Target keys missing in J-Quants response. Keys found: {list(stmt.keys())[:5]}")
                 
             equity = float(equity_raw)
             total_assets = float(assets_raw)
