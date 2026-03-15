@@ -38,7 +38,7 @@ class JQuantsV2Client:
         self.consecutive_403_count: int = 0
 
     def get_statements(self, ticker: str) -> Dict[str, Any]:
-        """最新の財務情報を取得する（エンドポイント '/fins/summary' を使用）"""
+        """最新の財務情報を取得する"""
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         if self.is_api_broken: return {}
             
@@ -148,7 +148,7 @@ class FundamentalCache:
             income_raw = stmt.get("NP") or stmt.get("Profit") or stmt.get("OP")
             
             if assets_raw is None or equity_raw is None:
-                raise ValueError(f"Target keys missing in J-Quants response. Keys found: {list(stmt.keys())[:5]}")
+                raise ValueError(f"Target keys missing in J-Quants response.")
                 
             equity = float(equity_raw)
             total_assets = float(assets_raw)
@@ -262,9 +262,11 @@ class SmallCapStrategyAnalyzer:
         
         if benchmark_df is not None and not benchmark_df.empty:
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
+            # 【MDD改善】相場環境フィルターの超厳格化。遅行する50日/200日線ではなく、25日/50日線の短期・中期パーフェクトオーダーを採用。
+            benchmark_df['bm_ma25'] = benchmark_df['close'].rolling(window=25).mean()
             benchmark_df['bm_ma50'] = benchmark_df['close'].rolling(window=50).mean()
-            benchmark_df['bm_ma200'] = benchmark_df['close'].rolling(window=200).mean()
-            benchmark_df['market_healthy'] = (benchmark_df['close'] > benchmark_df['bm_ma50']) & (benchmark_df['bm_ma50'] > benchmark_df['bm_ma200'])
+            benchmark_df['market_healthy'] = (benchmark_df['close'] > benchmark_df['bm_ma25']) & (benchmark_df['bm_ma25'] > benchmark_df['bm_ma50'])
+            
             df = df.merge(benchmark_df[['date', 'market_healthy']], on='date', how='left')
             df['market_healthy'] = df['market_healthy'].ffill().fillna(False)
             
@@ -284,7 +286,8 @@ class SmallCapStrategyAnalyzer:
         
         market_healthy = bool(row_dict.get('market_healthy', True))
         
-        if not market_healthy or vix >= 22.0:
+        # 【MDD改善】VIXの許容上限を22.0から20.0へさらに引き下げ、ボラティリティ相場での被弾を回避
+        if not market_healthy or vix >= 20.0:
             return False, 0.0, False
             
         roe = SmallCapStrategyAnalyzer._to_float(fund_data.get('roe', 0.0))
@@ -304,12 +307,16 @@ class SmallCapStrategyAnalyzer:
         
         rsi = SmallCapStrategyAnalyzer._to_float(row_dict.get('rsi', 0.0))
         atr_pct = SmallCapStrategyAnalyzer._to_float(row_dict.get('atr_pct', 0.0))
+        rs_21 = SmallCapStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0))
 
         score = 0.0
         
         if curr_c > ma25_val and ma25_val > ma50_val and ma50_val > ma200_val:
-            # 【MDD改善】ダマシ回避のため、RSIの基準を55.0に引き上げ、ATRを8.0%未満に厳格化
-            if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and rsi >= 55.0 and atr_pct < 8.0:
+            # 【MDD改善】
+            # 1. RSI上限を75.0に設定し、高値掴み（イナゴタワーの頂点）を回避。
+            # 2. ボラティリティ(atr_pct)の下限を6.0%未満にし、仕手株を完全に排除。
+            # 3. 相対強度(rs_21)が0以上（市場平均に勝っている銘柄）のみをエントリー対象にする。
+            if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and (55.0 <= rsi <= 75.0) and atr_pct < 6.0 and rs_21 >= 0.0:
                 score += 100.0
                 
         is_entry = (score >= 100.0) 
@@ -448,8 +455,8 @@ class SmallCapPortfolioBacktester:
                 if curr_c >= pos['entry_p'] + (current_atr * 1.5):
                     pos['breakeven_active'] = True
 
-                # 【MDD改善】ハードストップをATR2.0から1.5へタイト化（損切りを早くする）
-                atr_stop = pos['entry_p'] - (current_atr * 1.5)
+                # 【MDD改善】ハードストップをATR 1.5から 1.0 へ究極にタイト化。ダメなら即切る。
+                atr_stop = pos['entry_p'] - (current_atr * 1.0)
                 hard_stop_price = min(atr_stop, pos['swing_low'] * 0.99)
                 
                 if pos['breakeven_active']:
@@ -466,14 +473,14 @@ class SmallCapPortfolioBacktester:
                     exit_score += 100
                     self.stats['climax_exits'] += 1
 
-                # 【MDD改善】トレイリングストップをATR2.5から2.0へ引き下げ（利益を早めに確定）
-                trailing_stop_price = pos['high_p'] - (current_atr * 2.0)
+                # 【MDD改善】トレイリングストップをATR 2.0から 1.5 へ引き下げ。利益が乗ったら逃さない。
+                trailing_stop_price = pos['high_p'] - (current_atr * 1.5)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                # 【資金効率改善】タイムストップを10日から8日へ短縮し、見込みなしのポジションを素早く切る
-                if pos['days_held'] >= 8 and curr_c < (pos['entry_p'] * 1.02) and exit_score == 0: 
+                # 【MDD改善】タイムストップを8日から「5日」へ極限まで短縮。資金拘束による被弾を回避。
+                if pos['days_held'] >= 5 and curr_c < (pos['entry_p'] * 1.02) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
 
@@ -551,7 +558,7 @@ def run_integrity_tests() -> None:
     dummy_row_ok = {
         'close': 1050.0, 'ma25': 1000.0, 'ma50': 950.0, 'ma200': 800.0,
         'vol_ratio': 2.5, 'is_bullish': True, 'close_position': 0.8,
-        'market_healthy': True, 'rsi': 56.0, 'atr_pct': 7.0
+        'market_healthy': True, 'rsi': 60.0, 'atr_pct': 5.0, 'rs_21': 2.0
     }
     dummy_fund_ok = {'roe': 12.0, 'equity_ratio': 55.0}
     try:
@@ -622,10 +629,10 @@ if __name__ == "__main__":
         print(f" 🔬 小型株ロジック 分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
-        print(f" [3] タイムストップ(8日)撤退: {st['time_stops']} 回")
+        print(f" [3] タイムストップ(5日)撤退: {st['time_stops']} 回")
         print(f" [4] 建値ストップ(負け回避): {st['breakeven_stops']} 回")
         print(f" [5] ハードストップ(安値割れ): {st['hard_stops']} 回")
-        print(f" [6] トレイリングストップ(2.0ATR): {st['trailing_stops']} 回")
+        print(f" [6] トレイリングストップ(1.5ATR): {st['trailing_stops']} 回")
         print(f" [7] クライマックス売り(過熱極致): {st['climax_exits']} 回")
         print(f"==================================================", flush=True)
         
