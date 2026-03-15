@@ -87,8 +87,15 @@ class JQuantsV2Client:
                 if not data:
                     return {}
                 
-                # 【修正】V2仕様における開示日キー「DiscDate」に対応
                 data.sort(key=lambda x: str(x.get("DiscDate") or x.get("DisclosedDate") or x.get("Date") or ""))
+                
+                # 【重要修正】財務データ（総資産・自己資本）が実際に含まれている最新の開示を逆順で探し出す
+                # これにより、業績予想の修正など「中身が空のIRニュース」を掴んでしまうエラーを排除
+                for stmt in reversed(data):
+                    if ("TA" in stmt or "TotalAssets" in stmt) and ("Eq" in stmt or "Equity" in stmt):
+                        return stmt
+                        
+                # 財務データ入りが見つからない場合は仕方なく最新のものを返す（呼び出し側でフォールバック）
                 return data[-1]
                 
             except Exception as e:
@@ -112,7 +119,6 @@ class FundamentalCache:
         self.filepath = os.path.join(data_dir, "fundamentals_cache.json")
         self.jq_client = JQuantsV2Client(api_key)
         self.data: Dict[str, Dict[str, Any]] = self._load()
-        self._validate_and_repair_cache()
 
     def _load(self) -> Dict[str, Dict[str, Any]]:
         if os.path.exists(self.filepath):
@@ -123,36 +129,16 @@ class FundamentalCache:
                 debug_log(f"Failed to load fundamental cache: {e}")
         return {}
 
-    def _validate_and_repair_cache(self) -> None:
-        """過去のバグで「failed」として記録されたキャッシュを強制破棄し再取得させる"""
-        if not self.data: return
-        
-        # 失敗記録を全て削除（これがないと永遠にyfinanceにフォールバックし続けます）
-        keys_to_delete = [k for k, v in self.data.items() if v.get('status') == 'failed']
-        for k in keys_to_delete:
-            del self.data[k]
-            
-        valid_count = sum(1 for d in self.data.values() if float(d.get('roe', 0.0)) >= 10.0 and float(d.get('equity_ratio', 0.0)) >= 50.0)
-                
-        if valid_count == 0 and len(self.data) > 50:
-            debug_log("WARNING: Local cache has 0 valid companies. Forcing cache clear...")
-            self.data = {}
-            if os.path.exists(self.filepath):
-                try: os.remove(self.filepath)
-                except: pass
-
     def get_fundamentals(self, ticker: str) -> Dict[str, float]:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
+        # 【重要修正】キャッシュに存在する場合は、その値（0.0であっても）を即座に返し、再取得を絶対に許可しない。
+        # これにより、バックテスト中の日付ループのたびにAPIを叩きに行く「無限ループ」を完全に阻止。
         if ticker in self.data:
-            if self.data[ticker].get('status') == 'failed':
-                return {'roe': 0.0, 'equity_ratio': 0.0}
-            
-            roe_val = self.data[ticker].get('roe', 0.0)
-            eq_val = self.data[ticker].get('equity_ratio', 0.0)
-            
-            if roe_val not in [0.0, -999.0] and eq_val not in [0.0, -999.0]:
-                return {'roe': float(roe_val), 'equity_ratio': float(eq_val)}
+            return {
+                'roe': float(self.data[ticker].get('roe', 0.0)),
+                'equity_ratio': float(self.data[ticker].get('equity_ratio', 0.0))
+            }
 
         debug_log(f"Fetching fundamentals for {ticker}...")
         roe, equity_ratio = 0.0, 0.0
@@ -163,7 +149,7 @@ class FundamentalCache:
             if not stmt:
                 raise ValueError("No data returned from J-Quants")
             
-            # 【重要修正】V2仕様の短縮キーに完全対応（TA: 総資産, Eq: 自己資本, NP: 純利益）
+            # V2仕様の短縮キーに完全対応
             assets_raw = stmt.get("TA") or stmt.get("TotalAssets")
             equity_raw = stmt.get("Eq") or stmt.get("Equity")
             income_raw = stmt.get("NP") or stmt.get("Profit") or stmt.get("OP")
@@ -196,6 +182,7 @@ class FundamentalCache:
                 debug_log(f"yfinance fallback also failed for {ticker}. Handled safely.")
                 roe, equity_ratio = 0.0, 0.0
                 
+        # 取得結果（失敗含む）を記録。次回からは確実にキャッシュを返す。
         self.data[ticker] = {
             'roe': roe, 
             'equity_ratio': equity_ratio,
@@ -396,6 +383,7 @@ class SmallCapPortfolioBacktester:
             df = SmallCapStrategyAnalyzer.calculate_indicators(df, bm_df)
             if df.empty: continue
             
+            # 初期化時に一度だけファンダメンタルズを取得・キャッシュ構築
             self.fund_cache.get_fundamentals(ticker)
             
             df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
@@ -508,6 +496,7 @@ class SmallCapPortfolioBacktester:
                 for ticker, row in today_market.items():
                     if ticker in positions: continue 
                     
+                    # 修正点：ここでキャッシュから確実に取得（APIへは行かない）
                     fund_data = self.fund_cache.get_fundamentals(ticker)
                     is_entry, score, is_high_risk = SmallCapStrategyAnalyzer.evaluate_entry(row, n_chg, vix, fund_data)
                     
