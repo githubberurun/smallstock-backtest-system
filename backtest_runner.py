@@ -65,7 +65,7 @@ class JQuantsV2Client:
         return {}
 
 # ==========================================
-# 2. ファンダメンタルズ・キャッシュマネージャー（完全浄化・自動修復版）
+# 2. ファンダメンタルズ・キャッシュマネージャー（完全浄化・自動修復・ネガティブキャッシュ版）
 # ==========================================
 class FundamentalCache:
     """J-Quantsからの情報取得負荷を下げるためのローカルキャッシュ"""
@@ -75,10 +75,10 @@ class FundamentalCache:
         
         self.filepath = os.path.join(data_dir, "fundamentals_cache.json")
         self.jq_client = JQuantsV2Client(api_key)
-        self.data: Dict[str, Dict[str, float]] = self._load()
+        self.data: Dict[str, Dict[str, Any]] = self._load()
         self._validate_and_repair_cache()
 
-    def _load(self) -> Dict[str, Dict[str, float]]:
+    def _load(self) -> Dict[str, Dict[str, Any]]:
         if os.path.exists(self.filepath):
             try:
                 with open(self.filepath, 'r', encoding='utf-8') as f:
@@ -110,65 +110,73 @@ class FundamentalCache:
     def get_fundamentals(self, ticker: str) -> Dict[str, float]:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         
-        roe_val = self.data.get(ticker, {}).get('roe', 0.0)
-        eq_val = self.data.get(ticker, {}).get('equity_ratio', 0.0)
+        # すでにキャッシュに存在し、かつ "failed" ステータスが記録されている場合は即座にゼロを返し、再取得を行わない（403ループ防止）
+        if ticker in self.data:
+            if self.data[ticker].get('status') == 'failed':
+                return {'roe': 0.0, 'equity_ratio': 0.0}
+            
+            roe_val = self.data[ticker].get('roe', 0.0)
+            eq_val = self.data[ticker].get('equity_ratio', 0.0)
+            
+            # 正常に取得できているとみなす
+            if roe_val not in [0.0, -999.0] and eq_val not in [0.0, -999.0]:
+                return {'roe': float(roe_val), 'equity_ratio': float(eq_val)}
+
+        debug_log(f"Fetching fundamentals for {ticker}...")
+        roe, equity_ratio = 0.0, 0.0
+        success = False
         
-        needs_fetch = False
-        if ticker not in self.data:
-            needs_fetch = True
-        elif roe_val in [0.0, -999.0] and eq_val in [0.0, -999.0]:
-            needs_fetch = True
-        elif roe_val == -999.0 or eq_val == -999.0:
-            needs_fetch = True
+        try:
+            stmt = self.jq_client.get_statements(ticker)
+            if not stmt:
+                raise ValueError("No data returned from J-Quants")
             
-        if needs_fetch:
-            debug_log(f"Fetching fundamentals for {ticker}...")
-            roe, equity_ratio = 0.0, 0.0
+            assets_raw = stmt.get("TotalAssets") or stmt.get("TotAssets") or stmt.get("TotalAsset")
+            equity_raw = stmt.get("Equity") or stmt.get("NetAssets") or stmt.get("Eq")
+            income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("OperatingProfit")
             
+            if assets_raw is None or equity_raw is None:
+                raise ValueError("Target keys missing in J-Quants response")
+                
+            equity = float(equity_raw)
+            total_assets = float(assets_raw)
+            net_income = float(income_raw) if income_raw else 0.0
+            
+            equity_ratio = (equity / total_assets * 100.0) if total_assets > 0 else 0.0
+            roe = (net_income / equity * 100.0) if equity > 0 else 0.0
+            success = True
+            
+        except Exception as e:
+            debug_log(f"J-Quants failed for {ticker} ({e}). Falling back to yfinance...")
             try:
-                stmt = self.jq_client.get_statements(ticker)
-                if not stmt:
-                    raise ValueError("No data returned from J-Quants")
+                yf_ticker = f"{ticker}.T" if ticker.isdigit() else ticker
+                info = yf.Ticker(yf_ticker).info
                 
-                assets_raw = stmt.get("TotalAssets") or stmt.get("TotAssets") or stmt.get("TotalAsset")
-                equity_raw = stmt.get("Equity") or stmt.get("NetAssets") or stmt.get("Eq")
-                income_raw = stmt.get("Profit") or stmt.get("NetIncome") or stmt.get("OperatingProfit")
+                r_raw = info.get('returnOnEquity', 0.0)
+                roe = float(r_raw) * 100 if r_raw is not None else 0.0
                 
-                if assets_raw is None or equity_raw is None:
-                    raise ValueError("Target keys missing in J-Quants response")
-                    
-                equity = float(equity_raw)
-                total_assets = float(assets_raw)
-                net_income = float(income_raw) if income_raw else 0.0
+                d_raw = info.get('debtToEquity', 0.0)
+                dte = float(d_raw) if d_raw is not None else 0.0
+                equity_ratio = 100.0 / (1.0 + (dte / 100.0)) if dte else 0.0
+                success = True if (roe != 0.0 or equity_ratio != 0.0) else False
+            except Exception as ye:
+                debug_log(f"yfinance fallback also failed for {ticker}: {ye}")
+                roe, equity_ratio = 0.0, 0.0
                 
-                equity_ratio = (equity / total_assets * 100.0) if total_assets > 0 else 0.0
-                roe = (net_income / equity * 100.0) if equity > 0 else 0.0
-                
-            except Exception as e:
-                debug_log(f"J-Quants failed for {ticker} ({e}). Falling back to yfinance...")
-                try:
-                    yf_ticker = f"{ticker}.T" if ticker.isdigit() else ticker
-                    info = yf.Ticker(yf_ticker).info
-                    
-                    r_raw = info.get('returnOnEquity', 0.0)
-                    roe = float(r_raw) * 100 if r_raw is not None else 0.0
-                    
-                    d_raw = info.get('debtToEquity', 0.0)
-                    dte = float(d_raw) if d_raw is not None else 0.0
-                    equity_ratio = 100.0 / (1.0 + (dte / 100.0)) if dte else 0.0
-                except Exception as ye:
-                    debug_log(f"yfinance fallback also failed for {ticker}: {ye}")
-                    roe, equity_ratio = 0.0, 0.0
-                    
-            self.data[ticker] = {'roe': roe, 'equity_ratio': equity_ratio}
+        # 成功・失敗にかかわらず、結果とステータスをキャッシュに保存する（ネガティブキャッシュ）
+        self.data[ticker] = {
+            'roe': roe, 
+            'equity_ratio': equity_ratio,
+            'status': 'success' if success else 'failed'
+        }
+        
+        try:
+            with open(self.filepath, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
             
-            try:
-                with open(self.filepath, 'w', encoding='utf-8') as f:
-                    json.dump(self.data, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
-                
-        return self.data[ticker]
+        return {'roe': roe, 'equity_ratio': equity_ratio}
 
 # ==========================================
 # 3. 小型株専用・統合分析エンジン (Q-Mo Strategy)
