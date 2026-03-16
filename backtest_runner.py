@@ -264,7 +264,6 @@ class SmallCapStrategyAnalyzer:
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
             benchmark_df['bm_ma25'] = benchmark_df['close'].rolling(window=25).mean()
             benchmark_df['bm_ma50'] = benchmark_df['close'].rolling(window=50).mean()
-            # 相場全体のトレンドフィルター（25日線 > 50日線）は維持
             benchmark_df['market_healthy'] = (benchmark_df['close'] > benchmark_df['bm_ma25']) & (benchmark_df['bm_ma25'] > benchmark_df['bm_ma50'])
             
             df = df.merge(benchmark_df[['date', 'market_healthy']], on='date', how='left')
@@ -310,9 +309,8 @@ class SmallCapStrategyAnalyzer:
 
         score = 0.0
         
+        # エントリー基準は前回（好成績）のものを維持
         if curr_c > ma25_val and ma25_val > ma50_val and ma50_val > ma200_val:
-            # 【リターン回復】RSI上限を80.0に緩和。ボラティリティ上限を8.0%に戻し、暴れ馬も許容。
-            # ただし、相対強度(rs_21 >= 0)の条件は維持し「弱小銘柄のダマシ」は防ぐ。
             if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and (55.0 <= rsi <= 80.0) and atr_pct < 8.0 and rs_21 >= 0.0:
                 score += 100.0
                 
@@ -359,10 +357,12 @@ class SmallCapPortfolioBacktester:
         self.us_market = USMarketCache()
         self.fund_cache = FundamentalCache(data_dir, api_key)
         
+        # 新しい脱出ロジック 'trend_stops' を追加
         self.stats = {
             'orders_placed': 0, 'orders_exec': 0,
             'time_stops': 0, 'hard_stops': 0, 'trailing_stops': 0,
-            'breakeven_stops': 0, 'climax_exits': 0, 'gap_cancels': 0
+            'breakeven_stops': 0, 'climax_exits': 0, 'gap_cancels': 0,
+            'trend_stops': 0
         }
         
         debug_log("Loading and calculating indicators for SMALL CAP tickers...")
@@ -444,6 +444,7 @@ class SmallCapPortfolioBacktester:
                 curr_c = SmallCapStrategyAnalyzer._to_float(row.get('close', 0.0))
                 current_atr = SmallCapStrategyAnalyzer._to_float(row.get('atr', 0.0))
                 rsi = SmallCapStrategyAnalyzer._to_float(row.get('rsi', 0.0))
+                ma20_val = SmallCapStrategyAnalyzer._to_float(row.get('ma20', 0.0))
                 
                 pos['days_held'] += 1
                 pos['high_p'] = max(pos['high_p'], curr_c)
@@ -452,14 +453,19 @@ class SmallCapPortfolioBacktester:
                 if curr_c >= pos['entry_p'] + (current_atr * 1.5):
                     pos['breakeven_active'] = True
 
-                # 【リターン回復】ハードストップをATR 1.5へ緩和（多少のノイズは耐える）
+                # 【新規MDD対策】トレンドストップ (20日線割れ)
+                # 保有から3日目以降、終値が20日移動平均線を割ったら「トレンド終了」とみなし即時撤退
+                if pos['days_held'] >= 3 and curr_c < ma20_val and exit_score == 0:
+                    exit_score += 100
+                    self.stats['trend_stops'] += 1
+
                 atr_stop = pos['entry_p'] - (current_atr * 1.5)
                 hard_stop_price = min(atr_stop, pos['swing_low'] * 0.99)
                 
                 if pos['breakeven_active']:
                     hard_stop_price = max(hard_stop_price, pos['entry_p'] * 1.005)
                 
-                if curr_c <= hard_stop_price:
+                if curr_c <= hard_stop_price and exit_score == 0:
                     exit_score += 100
                     if pos['breakeven_active']:
                         self.stats['breakeven_stops'] += 1
@@ -470,15 +476,14 @@ class SmallCapPortfolioBacktester:
                     exit_score += 100
                     self.stats['climax_exits'] += 1
 
-                # 【リターン回復】トレイリングストップをATR 2.5へ緩和（利益を大相場に育てる）
-                trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
+                # 【MDD対策】トレイリングストップを 2.5ATR から 2.0ATR に締め直し
+                trailing_stop_price = pos['high_p'] - (current_atr * 2.0)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                # 【リターン回復】タイムストップを8日に戻し、かつ「建値より下がっている場合のみ」切る。
-                # 8日経過しても少しでも含み益（1.01倍以上）があるなら、まだ育つと信じて握力強めにホールド。
-                if pos['days_held'] >= 8 and curr_c <= (pos['entry_p'] * 1.01) and exit_score == 0: 
+                # 【MDD対策】タイムストップを 5日 に厳格化。動かない資金拘束は全体の下落リスクを上げるだけ。
+                if pos['days_held'] >= 5 and curr_c <= (pos['entry_p'] * 1.01) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
 
@@ -627,11 +632,12 @@ if __name__ == "__main__":
         print(f" 🔬 小型株ロジック 分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
-        print(f" [3] タイムストップ(8日/含み損撤退): {st['time_stops']} 回")
+        print(f" [3] タイムストップ(5日/含み損撤退): {st['time_stops']} 回")
         print(f" [4] 建値ストップ(負け回避): {st['breakeven_stops']} 回")
         print(f" [5] ハードストップ(安値割れ): {st['hard_stops']} 回")
-        print(f" [6] トレイリングストップ(2.5ATR): {st['trailing_stops']} 回")
+        print(f" [6] トレイリングストップ(2.0ATR): {st['trailing_stops']} 回")
         print(f" [7] クライマックス売り(過熱極致): {st['climax_exits']} 回")
+        print(f" [8] トレンド割れ撤退(20日線割れ): {st['trend_stops']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
