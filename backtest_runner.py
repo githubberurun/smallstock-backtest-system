@@ -190,7 +190,7 @@ class FundamentalCache:
         return {'roe': roe, 'equity_ratio': equity_ratio}
 
 # ==========================================
-# 3. 小型株専用・統合分析エンジン (Mean Reversion Strategy)
+# 3. 小型株専用・統合分析エンジン (VCP / Volatility Breakout)
 # ==========================================
 class SmallCapStrategyAnalyzer:
     @staticmethod
@@ -218,22 +218,19 @@ class SmallCapStrategyAnalyzer:
         df['prev_close'] = df['close'].shift(1)
         
         df['ma5'] = df['close'].rolling(window=5).mean()
+        df['ma20'] = df['close'].rolling(window=20).mean()
         df['ma25'] = df['close'].rolling(window=25).mean()
         df['ma50'] = df['close'].rolling(window=50).mean()
-        df['ma75'] = df['close'].rolling(window=75).mean()
         df['ma200'] = df['close'].rolling(window=200).mean()
-        df['dev25'] = (df['close'] - df['ma25']) / df['ma25'] * 100
         
-        df['ma20'] = df['close'].rolling(window=20).mean()
         df['std20'] = df['close'].rolling(window=20).std()
         df['bb_upper'] = df['ma20'] + (df['std20'] * 2)
         df['bb_lower'] = df['ma20'] - (df['std20'] * 2)
         
-        df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
-        df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
-        df['macd'] = df['ema12'] - df['ema26']
-        df['sig'] = df['macd'].ewm(span=9, adjust=False).mean()
-        df['macd_hist'] = df['macd'] - df['sig']
+        # 【VCP専用指標】ボリンジャーバンドの収縮度合い（スクイーズ）を測定
+        df['bb_width'] = ((df['bb_upper'] - df['bb_lower']) / df['ma20']).replace([np.inf, -np.inf], np.nan).fillna(0)
+        # 過去20日間の最小バンド幅（最もエネルギーが圧縮された状態）
+        df['bb_width_min'] = df['bb_width'].rolling(window=20).min().fillna(0)
         
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -249,9 +246,13 @@ class SmallCapStrategyAnalyzer:
         df['atr'] = df['tr'].rolling(window=14).mean() 
         df['atr_pct'] = (df['atr'] / df['close']) * 100
         
+        # 出来高の急増（機関投資家の参入サイン）
         df['vol_ma25'] = df['volume'].rolling(25).mean().replace(0, np.nan)
         df['vol_ratio'] = (df['volume'] / df['vol_ma25']).fillna(0)
         
+        df['is_bullish'] = df['close'] > df['open']
+        day_range = (df['high'] - df['low']).replace(0, np.nan)
+        df['close_position'] = ((df['close'] - df['low']) / day_range).fillna(0)
         df['lowest_5'] = df['low'].rolling(window=5).min()
         
         if benchmark_df is not None and not benchmark_df.empty:
@@ -274,31 +275,37 @@ class SmallCapStrategyAnalyzer:
         
         market_healthy = bool(row_dict.get('market_healthy', True))
         
-        # VIXフィルターは25まで許容（パニック相場こそ押し目のチャンス）
         if not market_healthy or vix >= 25.0:
             return False, 0.0, False
             
         roe = SmallCapStrategyAnalyzer._to_float(fund_data.get('roe', 0.0))
         eq_ratio = SmallCapStrategyAnalyzer._to_float(fund_data.get('equity_ratio', 0.0))
         
-        # 業績が悪いボロ株の暴落は単なる倒産リスクなので除外
+        # 業績ベースは死守（優良企業の爆発のみを狙う）
         if roe < 10.0 or eq_ratio < 50.0:
             return False, 0.0, False 
             
         curr_c = SmallCapStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         ma50_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('ma50', 0.0))
         ma200_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('ma200', 0.0))
-        bb_lower_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('bb_lower', 0.0))
-        rsi = SmallCapStrategyAnalyzer._to_float(row_dict.get('rsi', 0.0))
+        
+        vol_ratio = SmallCapStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0))
+        is_bullish = bool(row_dict.get('is_bullish', False))
+        close_pos = SmallCapStrategyAnalyzer._to_float(row_dict.get('close_position', 0.0))
+        
+        bb_width = SmallCapStrategyAnalyzer._to_float(row_dict.get('bb_width', 1.0))
+        bb_width_min = SmallCapStrategyAnalyzer._to_float(row_dict.get('bb_width_min', 1.0))
 
         score = 0.0
         
-        # 【大転換：押し目買いロジック】
-        # 長期的なトレンドは上向き（MA50 > MA200）だが、
-        # 短期的に売られすぎ（株価がBB-2σ以下、またはRSIが30未満）の時に逆張りでエントリー
-        if ma50_val > ma200_val:
-            if curr_c <= bb_lower_val or rsi <= 30.0:
-                score += 100.0
+        # 【大転換：VCP スクイーズ・ブレイクアウト】
+        # 条件1: 長期トレンドは「上」（MA50 > MA200）
+        if curr_c > ma200_val and ma50_val > ma200_val:
+            # 条件2: 直近でボラティリティが死滅し、エネルギーが極限まで圧縮されている（スクイーズ状態）
+            if bb_width <= (bb_width_min * 1.2) or bb_width <= 0.10:
+                # 条件3: その静寂を破り、出来高が平時の「3倍以上」に急増し、かつ大陽線（高値引け）でブレイク
+                if vol_ratio >= 3.0 and is_bullish and close_pos >= 0.8:
+                    score += 100.0
                 
         is_entry = (score >= 100.0) 
         return is_entry, float(score), False
@@ -343,13 +350,10 @@ class SmallCapPortfolioBacktester:
         self.us_market = USMarketCache()
         self.fund_cache = FundamentalCache(data_dir, api_key)
         
-        # エグジットの理由を押し目買い仕様にリニューアル
         self.stats = {
             'orders_placed': 0, 'orders_exec': 0,
-            'target_reached': 0,  # 平均回帰達成（利確）
-            'hard_stops': 0,      # 10%下落（底抜け損切り）
-            'time_stops': 0,      # 15日経過（資金回収）
-            'gap_cancels': 0
+            'trailing_stops': 0, 'hard_stops': 0,
+            'time_stops': 0, 'gap_cancels': 0
         }
         
         debug_log("Loading and calculating indicators for SMALL CAP tickers...")
@@ -404,7 +408,8 @@ class SmallCapPortfolioBacktester:
                     
                     self.stats['orders_placed'] += 1
                     
-                    if open_p > (prev_close * 1.02) or open_p < (prev_close * 0.98):
+                    # 異常なギャップアップは高値掴みになるので見送り
+                    if open_p > (prev_close * 1.05) or open_p < (prev_close * 0.98):
                         self.stats['gap_cancels'] += 1
                         continue 
                         
@@ -427,29 +432,27 @@ class SmallCapPortfolioBacktester:
                 row = today_market[ticker]
                 
                 curr_c = SmallCapStrategyAnalyzer._to_float(row.get('close', 0.0))
-                ma20_val = SmallCapStrategyAnalyzer._to_float(row.get('ma20', 0.0))
-                rsi = SmallCapStrategyAnalyzer._to_float(row.get('rsi', 0.0))
+                current_atr = SmallCapStrategyAnalyzer._to_float(row.get('atr', 0.0))
                 
                 pos['days_held'] += 1
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
                 
-                # 【エグジット1：平均回帰完了（利確）】
-                # 株価が20日線（平均）まで戻った、あるいはRSIが60（買われ気味）まで回復したら手仕舞い
-                if curr_c >= ma20_val or rsi >= 60.0:
-                    if curr_c > pos['entry_p']: # 利益が出ている場合のみ
-                        exit_score += 100
-                        self.stats['target_reached'] += 1
-
-                # 【エグジット2：底抜け（ハードストップ）】
-                # エントリー価格から10%下落したら、想定外の悪材料とみなし強制損切り
-                if curr_c <= pos['entry_p'] * 0.90 and exit_score == 0:
+                # 【エグジット：VCP特化型】
+                # トレイリングストップ: 乗った波は高値から 2.0 ATR 下がるまで徹底的にホールド
+                trailing_stop_price = pos['high_p'] - (current_atr * 2.0)
+                if curr_c <= trailing_stop_price and exit_score == 0:
+                    exit_score += 100
+                    self.stats['trailing_stops'] += 1
+                    
+                # ハードストップ（損切り）: エントリーの根拠（ブレイク時の安値付近）が崩れたら即撤退。1.5 ATR。
+                hard_stop_price = pos['entry_p'] - (current_atr * 1.5)
+                if curr_c <= hard_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['hard_stops'] += 1
                 
-                # 【エグジット3：時間切れ（タイムストップ）】
-                # 押し目買いは時間がかかるが、15日経過しても回復しないなら資金を抜く
-                if pos['days_held'] >= 15 and exit_score == 0: 
+                # タイムストップ: 爆発を狙って買ったのに、8日経っても建値付近でウロウロしているなら「不発弾」と見なす
+                if pos['days_held'] >= 8 and curr_c <= (pos['entry_p'] * 1.02) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
 
@@ -524,16 +527,18 @@ def run_integrity_tests() -> None:
     res_df = SmallCapStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    # 【テスト修正】押し目買い（逆張り）の条件を満たすダミーデータに変更
+    # 【テスト修正】VCPブレイクアウトの条件を満たすダミーデータに変更
     dummy_row_ok = {
-        'close': 850.0, 'ma50': 1000.0, 'ma200': 800.0, 'bb_lower': 860.0,
-        'rsi': 25.0, 'market_healthy': True, 'atr_pct': 5.0
+        'close': 1050.0, 'ma50': 1000.0, 'ma200': 900.0,
+        'bb_width': 0.08, 'bb_width_min': 0.08, # ボラティリティ収縮（スクイーズ）
+        'vol_ratio': 4.0, 'is_bullish': True, 'close_position': 0.9, # 出来高急増の大陽線引け
+        'market_healthy': True
     }
     dummy_fund_ok = {'roe': 12.0, 'equity_ratio': 55.0}
     try:
         is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, 0.0, 15.0, dummy_fund_ok)
         assert isinstance(score, float)
-        assert is_entry is True, "Valid Mean Reversion row should return True"
+        assert is_entry is True, "Valid VCP Breakout row should return True"
     except Exception as e:
         raise AssertionError(f"Failed handling valid data: {e}")
 
@@ -582,7 +587,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 SMALL CAP SIMULATION RESULTS (MEAN REVERSION STRATEGY)")
+        print(f" 📊 SMALL CAP SIMULATION RESULTS (VCP BREAKOUT STRATEGY)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -595,12 +600,12 @@ if __name__ == "__main__":
         exec_rate = (st['orders_exec'] / st['orders_placed']) * 100 if st['orders_placed'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 押し目買いロジック 分析レポート")
+        print(f" 🔬 VCPスクイーズ・ブレイクアウト 分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
-        print(f" [3] 平均回帰達成（利確）: {st['target_reached']} 回")
-        print(f" [4] 底抜け損切り(-10%): {st['hard_stops']} 回")
-        print(f" [5] 時間切れ撤退(15日): {st['time_stops']} 回")
+        print(f" [3] トレイリングストップ(利大確定): {st['trailing_stops']} 回")
+        print(f" [4] ハードストップ(損小撤退): {st['hard_stops']} 回")
+        print(f" [5] 不発弾の撤退(8日経過): {st['time_stops']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
