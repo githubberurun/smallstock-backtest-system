@@ -300,7 +300,7 @@ class SmallCapStrategyAnalyzer:
 
         score = 0.0
         
-        # エントリーロジックは完璧に機能しているため一切変更なし
+        # エントリー基準は完全に機能しているため据え置き
         if curr_c > ma200_val and ma50_val > ma200_val:
             if bb_width <= (bb_width_min * 1.2) or bb_width <= 0.10:
                 if vol_ratio >= 3.0 and is_bullish and close_pos >= 0.8 and rs_21 > 0.0:
@@ -351,7 +351,7 @@ class SmallCapPortfolioBacktester:
         
         self.stats = {
             'orders_placed': 0, 'orders_exec': 0,
-            'trailing_stops': 0, 'hard_stops': 0,
+            'take_profit': 0, 'trailing_stops': 0, 'hard_stops': 0,
             'breakeven_stops': 0, 'time_stops': 0, 'gap_cancels': 0
         }
         
@@ -421,7 +421,7 @@ class SmallCapPortfolioBacktester:
                         positions[ticker] = {
                             'qty': qty, 'entry_p': exec_price, 'high_p': exec_price, 
                             'days_held': 0, 'swing_low': lowest_5,
-                            'breakeven_active': False # 新規: 建値ストップフラグ
+                            'breakeven_active': False
                         }
                         self.stats['orders_exec'] += 1
             pending_orders = new_pending
@@ -433,22 +433,28 @@ class SmallCapPortfolioBacktester:
                 
                 curr_c = SmallCapStrategyAnalyzer._to_float(row.get('close', 0.0))
                 current_atr = SmallCapStrategyAnalyzer._to_float(row.get('atr', 0.0))
+                rsi = SmallCapStrategyAnalyzer._to_float(row.get('rsi', 0.0))
                 
                 pos['days_held'] += 1
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
-                
-                # 【新設：フリーロール化】
-                # 株価がエントリーから 1.0 ATR 分上昇したら、ストップを建値(+手数料分)に引き上げる
-                if pos['high_p'] >= pos['entry_p'] + current_atr:
+
+                # 【1. テイクプロフィット（クライマックス利確）】
+                # 含み益が+25%を超えるか、RSIが85を超えたら「やりすぎ」と判断し問答無用で全株利確。
+                if (curr_c >= pos['entry_p'] * 1.25 or rsi >= 85.0) and exit_score == 0:
+                    exit_score += 100
+                    self.stats['take_profit'] += 1
+
+                # 【2. フリーロール化の遅延】
+                # 2.0 ATR分の上昇を確認して初めてストップを建値に移動。初期のノイズによる狩られを防ぐ。
+                if pos['high_p'] >= pos['entry_p'] + (current_atr * 2.0):
                     pos['breakeven_active'] = True
 
-                # 【修正：ハードストップ＆建値ストップ】
-                hard_stop_price = pos['entry_p'] - (current_atr * 1.5)
+                # 【3. ハードストップ＆建値ストップ】
+                hard_stop_price = pos['entry_p'] - (current_atr * 2.0)
                 if pos['swing_low'] > 0:
                     hard_stop_price = min(hard_stop_price, pos['swing_low'] * 0.98) 
                 
-                # フリーロール発動中は、絶対に損しないラインで撤退
                 if pos.get('breakeven_active', False):
                     hard_stop_price = max(hard_stop_price, pos['entry_p'] * 1.005) 
                 
@@ -459,16 +465,16 @@ class SmallCapPortfolioBacktester:
                     else:
                         self.stats['hard_stops'] += 1
                         
-                # 【修正：トレイリングストップの適正化】
-                # 3.0 ATRは返しすぎなので 1.5 ATR に引き締め、急騰後の急落を利益でロックする
-                trailing_stop_price = pos['high_p'] - (current_atr * 1.5)
+                # 【4. トレイリングストップの緩和】
+                # 2.5 ATRに戻し、急騰中の「ふるい落とし（意図的な急落）」に耐えて大波に乗り続ける。
+                trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                # 【修正：不発弾の即切り】
-                # 12日間も資金を寝かせない。ブレイクして5日経っても建値付近ならダマシ。即資金回収。
-                if pos['days_held'] >= 5 and curr_c <= (pos['entry_p'] * 1.02) and exit_score == 0: 
+                # 【5. タイムストップの最適化】
+                # 8日経過時点で建値(+2%)を超えられない銘柄は、ダマシだったと見なして資金回収。
+                if pos['days_held'] >= 8 and curr_c <= (pos['entry_p'] * 1.02) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
 
@@ -615,13 +621,14 @@ if __name__ == "__main__":
         exec_rate = (st['orders_exec'] / st['orders_placed']) * 100 if st['orders_placed'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 プロ水準資金管理・分析レポート")
+        print(f" 🔬 急騰特化・資金管理分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
-        print(f" [3] 建値ストップ(無敗撤退): {st['breakeven_stops']} 回")
-        print(f" [4] ハードストップ(損小撤退): {st['hard_stops']} 回")
-        print(f" [5] トレイリングストップ(利益確保): {st['trailing_stops']} 回")
-        print(f" [6] 不発弾の即切り(5日経過): {st['time_stops']} 回")
+        print(f" [3] クライマックス利確(+25%超): {st['take_profit']} 回")
+        print(f" [4] トレイリングストップ(大波ホールド): {st['trailing_stops']} 回")
+        print(f" [5] 建値ストップ(無敗撤退): {st['breakeven_stops']} 回")
+        print(f" [6] ハードストップ(損小撤退): {st['hard_stops']} 回")
+        print(f" [7] 不発弾の撤退(8日経過): {st['time_stops']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
