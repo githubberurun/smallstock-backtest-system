@@ -190,7 +190,7 @@ class FundamentalCache:
         return {'roe': roe, 'equity_ratio': equity_ratio}
 
 # ==========================================
-# 3. 小型株専用・統合分析エンジン (High-Frequency VCP)
+# 3. 小型株専用・統合分析エンジン (High-Frequency VCP + Market Regime)
 # ==========================================
 class SmallCapStrategyAnalyzer:
     @staticmethod
@@ -256,7 +256,10 @@ class SmallCapStrategyAnalyzer:
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
             benchmark_df['bm_ma25'] = benchmark_df['close'].rolling(window=25).mean()
             benchmark_df['bm_ma50'] = benchmark_df['close'].rolling(window=50).mean()
-            benchmark_df['market_healthy'] = (benchmark_df['close'] > benchmark_df['bm_ma50'])
+            
+            # 【MDD殺し・マクロ地合いフィルター】
+            # TOPIXが25日線より上にあり、かつ25日線が50日線より上にある（明確な上昇トレンド）時のみ許可
+            benchmark_df['market_healthy'] = (benchmark_df['close'] > benchmark_df['bm_ma25']) & (benchmark_df['bm_ma25'] > benchmark_df['bm_ma50'])
             
             df = df.merge(benchmark_df[['date', 'market_healthy']], on='date', how='left')
             df['market_healthy'] = df['market_healthy'].ffill().fillna(False)
@@ -277,7 +280,6 @@ class SmallCapStrategyAnalyzer:
         
         market_healthy = bool(row_dict.get('market_healthy', True))
         
-        # VIX上限は「25.0」に戻し、ボラティリティ相場でのチャンスを逃さない
         if not market_healthy or vix >= 25.0:
             return False, 0.0, False
             
@@ -301,7 +303,7 @@ class SmallCapStrategyAnalyzer:
 
         score = 0.0
         
-        # エントリー（入り口）は前回のリターン爆発設定（138%時）を完全に維持
+        # 【138%エンジン】エントリー基準は最高効率だったスケーリング版に完全復元
         if curr_c > ma50_val and ma50_val > ma200_val:
             if bb_width <= 0.25:
                 if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and rs_21 > 0.0 and rsi < 80.0:
@@ -440,16 +442,16 @@ class SmallCapPortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
 
-                # 【最適化】テイクプロフィットを +35% から最も確実な +30% へ最適化。失速前に確実に仕留める。
-                if (curr_c >= pos['entry_p'] * 1.30 or rsi >= 85.0) and exit_score == 0:
+                # 【138%エンジン復元】テイクプロフィット: 確実な +25% へ戻す
+                if (curr_c >= pos['entry_p'] * 1.25 or rsi >= 85.0) and exit_score == 0:
                     exit_score += 100
                     self.stats['take_profit'] += 1
 
-                # フリーロール発動（2.0 ATR分の上昇で建値確保）
+                # フリーロール発動
                 if pos['high_p'] >= pos['entry_p'] + (current_atr * 2.0):
                     pos['breakeven_active'] = True
 
-                # 【最適化】ハードストップ（損切り）を 1.5 ATR から 2.0 ATR へ戻す。「ふるい落とし」での微損狩りを防ぐ。
+                # ハードストップ（2.0 ATR）
                 hard_stop_price = pos['entry_p'] - (current_atr * 2.0)
                 if pos['swing_low'] > 0:
                     hard_stop_price = min(hard_stop_price, pos['swing_low'] * 0.98) 
@@ -464,15 +466,14 @@ class SmallCapPortfolioBacktester:
                     else:
                         self.stats['hard_stops'] += 1
                         
-                # 【最適化】トレイリングストップを 2.0 ATR から 2.5 ATR へ戻す。ノイズを無視して大波に乗る。
-                trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
+                # 【138%エンジン復元】トレイリングストップ: 2.0 ATR へ引き締め、利益を逃さない
+                trailing_stop_price = pos['high_p'] - (current_atr * 2.0)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                # 【最適化】タイムストップを 5日 から 8日 へ戻す。
-                # ただし、「8日経過時に建値を割っている（含み損）」の場合のみ即切りとする。
-                if pos['days_held'] >= 8 and curr_c <= pos['entry_p'] and exit_score == 0: 
+                # 【138%エンジン復元】資金の超高回転: 5日経過で無条件即切り
+                if pos['days_held'] >= 5 and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
 
@@ -606,7 +607,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 SMALL CAP SIMULATION RESULTS (OPTIMIZED VCP STRATEGY)")
+        print(f" 📊 SMALL CAP SIMULATION RESULTS (MARKET REGIME + HIGH-SPEED VCP)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -619,14 +620,14 @@ if __name__ == "__main__":
         exec_rate = (st['orders_exec'] / st['orders_placed']) * 100 if st['orders_placed'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 黄金比エグジット・分析レポート")
+        print(f" 🔬 地合いフィルター・分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
-        print(f" [3] クライマックス利確(+30%超): {st['take_profit']} 回")
-        print(f" [4] トレイリングストップ(大波ホールド): {st['trailing_stops']} 回")
+        print(f" [3] 確実な利確(+25%超): {st['take_profit']} 回")
+        print(f" [4] トレイリングストップ(利益確保): {st['trailing_stops']} 回")
         print(f" [5] 建値ストップ(無敗撤退): {st['breakeven_stops']} 回")
         print(f" [6] ハードストップ(損小撤退): {st['hard_stops']} 回")
-        print(f" [7] 不発弾の撤退(8日経過/含み損): {st['time_stops']} 回")
+        print(f" [7] 資金の超高回転(5日即切り): {st['time_stops']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
