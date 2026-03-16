@@ -190,7 +190,7 @@ class FundamentalCache:
         return {'roe': roe, 'equity_ratio': equity_ratio}
 
 # ==========================================
-# 3. 小型株専用・統合分析エンジン (High-Frequency VCP)
+# 3. 小型株専用・統合分析エンジン (High-Frequency VCP + True Restored)
 # ==========================================
 class SmallCapStrategyAnalyzer:
     @staticmethod
@@ -257,7 +257,7 @@ class SmallCapStrategyAnalyzer:
             benchmark_df['bm_ma25'] = benchmark_df['close'].rolling(window=25).mean()
             benchmark_df['bm_ma50'] = benchmark_df['close'].rolling(window=50).mean()
             
-            # 【復元】138%時の最適地合いフィルター（TOPIXが50日線を上回っているか）
+            # TOPIXが50日線を上回っているか（地合いフィルター）
             benchmark_df['market_healthy'] = (benchmark_df['close'] > benchmark_df['bm_ma50'])
             
             df = df.merge(benchmark_df[['date', 'market_healthy']], on='date', how='left')
@@ -302,7 +302,7 @@ class SmallCapStrategyAnalyzer:
 
         score = 0.0
         
-        # 【復元】138%時の最高効率エントリーロジック
+        # エントリーロジック（138%時と同一）
         if curr_c > ma50_val and ma50_val > ma200_val:
             if bb_width <= 0.25:
                 if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and rs_21 > 0.0 and rsi < 80.0:
@@ -441,17 +441,17 @@ class SmallCapPortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
 
-                # 【138%復元】テイクプロフィット: +25%
+                # 1. テイクプロフィット: 138%時の完全設定 (+25%)
                 if (curr_c >= pos['entry_p'] * 1.25 or rsi >= 85.0) and exit_score == 0:
                     exit_score += 100
                     self.stats['take_profit'] += 1
 
-                # フリーロール発動
+                # 2. フリーロール発動: 2.0 ATR
                 if pos['high_p'] >= pos['entry_p'] + (current_atr * 2.0):
                     pos['breakeven_active'] = True
 
-                # 【138%復元】ハードストップ: 1.5 ATR
-                hard_stop_price = pos['entry_p'] - (current_atr * 1.5)
+                # 3. ハードストップ: 138%時の完全設定 (2.0 ATR)
+                hard_stop_price = pos['entry_p'] - (current_atr * 2.0)
                 if pos['swing_low'] > 0:
                     hard_stop_price = min(hard_stop_price, pos['swing_low'] * 0.98) 
                 
@@ -465,13 +465,13 @@ class SmallCapPortfolioBacktester:
                     else:
                         self.stats['hard_stops'] += 1
                         
-                # 【138%復元】トレイリングストップ: 2.0 ATR
-                trailing_stop_price = pos['high_p'] - (current_atr * 2.0)
+                # 4. トレイリングストップ: 【絶対的復元】 2.5 ATR (ノイズを許容し大波に乗る)
+                trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                # 【致命的バグ修正＆復元】8日経過時点で「建値(+2%)以下」の場合のみ切る
+                # 5. タイムストップ: 138%時の完全設定 (8日経過かつ建値+2%以下で撤退)
                 if pos['days_held'] >= 8 and curr_c <= (pos['entry_p'] * 1.02) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
@@ -606,7 +606,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 SMALL CAP SIMULATION RESULTS (RESTORED SCALED VCP STRATEGY)")
+        print(f" 📊 SMALL CAP SIMULATION RESULTS (TRUE RESTORED VCP STRATEGY)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -619,7 +619,7 @@ if __name__ == "__main__":
         exec_rate = (st['orders_exec'] / st['orders_placed']) * 100 if st['orders_placed'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 黄金比復元・分析レポート")
+        print(f" 🔬 真・138%完全復元 分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
         print(f" [3] クライマックス利確(+25%超): {st['take_profit']} 回")
