@@ -227,9 +227,7 @@ class SmallCapStrategyAnalyzer:
         df['bb_upper'] = df['ma20'] + (df['std20'] * 2)
         df['bb_lower'] = df['ma20'] - (df['std20'] * 2)
         
-        # 【VCP専用指標】ボリンジャーバンドの収縮度合い（スクイーズ）を測定
         df['bb_width'] = ((df['bb_upper'] - df['bb_lower']) / df['ma20']).replace([np.inf, -np.inf], np.nan).fillna(0)
-        # 過去20日間の最小バンド幅（最もエネルギーが圧縮された状態）
         df['bb_width_min'] = df['bb_width'].rolling(window=20).min().fillna(0)
         
         delta = df['close'].diff()
@@ -246,7 +244,6 @@ class SmallCapStrategyAnalyzer:
         df['atr'] = df['tr'].rolling(window=14).mean() 
         df['atr_pct'] = (df['atr'] / df['close']) * 100
         
-        # 出来高の急増（機関投資家の参入サイン）
         df['vol_ma25'] = df['volume'].rolling(25).mean().replace(0, np.nan)
         df['vol_ratio'] = (df['volume'] / df['vol_ma25']).fillna(0)
         
@@ -263,8 +260,14 @@ class SmallCapStrategyAnalyzer:
             
             df = df.merge(benchmark_df[['date', 'market_healthy']], on='date', how='left')
             df['market_healthy'] = df['market_healthy'].ffill().fillna(False)
+            
+            # 【復活】市場（ベンチマーク）と比較した相対強度（Relative Strength）
+            df = df.merge(benchmark_df[['date', 'close']], on='date', how='left', suffixes=('', '_bm'))
+            df['close_bm'] = df['close_bm'].ffill()
+            df['rs_21'] = (df['close'].pct_change(21) - df['close_bm'].pct_change(21)) * 100
         else:
             df['market_healthy'] = True
+            df['rs_21'] = 0.0
 
         return df
 
@@ -281,7 +284,6 @@ class SmallCapStrategyAnalyzer:
         roe = SmallCapStrategyAnalyzer._to_float(fund_data.get('roe', 0.0))
         eq_ratio = SmallCapStrategyAnalyzer._to_float(fund_data.get('equity_ratio', 0.0))
         
-        # 業績ベースは死守（優良企業の爆発のみを狙う）
         if roe < 10.0 or eq_ratio < 50.0:
             return False, 0.0, False 
             
@@ -295,16 +297,15 @@ class SmallCapStrategyAnalyzer:
         
         bb_width = SmallCapStrategyAnalyzer._to_float(row_dict.get('bb_width', 1.0))
         bb_width_min = SmallCapStrategyAnalyzer._to_float(row_dict.get('bb_width_min', 1.0))
+        rs_21 = SmallCapStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0))
 
         score = 0.0
         
-        # 【大転換：VCP スクイーズ・ブレイクアウト】
-        # 条件1: 長期トレンドは「上」（MA50 > MA200）
+        # VCP スクイーズ・ブレイクアウト + 相対強度の確認
         if curr_c > ma200_val and ma50_val > ma200_val:
-            # 条件2: 直近でボラティリティが死滅し、エネルギーが極限まで圧縮されている（スクイーズ状態）
             if bb_width <= (bb_width_min * 1.2) or bb_width <= 0.10:
-                # 条件3: その静寂を破り、出来高が平時の「3倍以上」に急増し、かつ大陽線（高値引け）でブレイク
-                if vol_ratio >= 3.0 and is_bullish and close_pos >= 0.8:
+                # 【追加入件】市場平均に勝っている「本物の強い銘柄（rs_21 > 0.0）」のみをピックアップ
+                if vol_ratio >= 3.0 and is_bullish and close_pos >= 0.8 and rs_21 > 0.0:
                     score += 100.0
                 
         is_entry = (score >= 100.0) 
@@ -405,10 +406,10 @@ class SmallCapPortfolioBacktester:
                     row = today_market[ticker]
                     open_p = SmallCapStrategyAnalyzer._to_float(row.get('open', 0.0))
                     prev_close = SmallCapStrategyAnalyzer._to_float(row.get('prev_close', open_p))
+                    lowest_5 = SmallCapStrategyAnalyzer._to_float(row.get('lowest_5', open_p))
                     
                     self.stats['orders_placed'] += 1
                     
-                    # 異常なギャップアップは高値掴みになるので見送り
                     if open_p > (prev_close * 1.05) or open_p < (prev_close * 0.98):
                         self.stats['gap_cancels'] += 1
                         continue 
@@ -421,7 +422,7 @@ class SmallCapPortfolioBacktester:
                         cash -= qty * exec_price
                         positions[ticker] = {
                             'qty': qty, 'entry_p': exec_price, 'high_p': exec_price, 
-                            'days_held': 0
+                            'days_held': 0, 'swing_low': lowest_5
                         }
                         self.stats['orders_exec'] += 1
             pending_orders = new_pending
@@ -438,21 +439,24 @@ class SmallCapPortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
                 
-                # 【エグジット：VCP特化型】
-                # トレイリングストップ: 乗った波は高値から 2.0 ATR 下がるまで徹底的にホールド
-                trailing_stop_price = pos['high_p'] - (current_atr * 2.0)
+                # 【エグジット大幅緩和（ホールド力の強化）】
+                # トレイリングストップ: 2.0 ATR -> 3.0 ATR に拡大。ふるい落としに耐え、大波に乗る。
+                trailing_stop_price = pos['high_p'] - (current_atr * 3.0)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                     
-                # ハードストップ（損切り）: エントリーの根拠（ブレイク時の安値付近）が崩れたら即撤退。1.5 ATR。
-                hard_stop_price = pos['entry_p'] - (current_atr * 1.5)
+                # ハードストップ: 1.5 ATR -> 2.0 ATR へ緩和。かつ、直近の「最安値」を割ったかどうかを最重視する。
+                hard_stop_price = pos['entry_p'] - (current_atr * 2.0)
+                if pos['swing_low'] > 0:
+                    hard_stop_price = min(hard_stop_price, pos['swing_low'] * 0.98) # 安値のさらに2%下
+                
                 if curr_c <= hard_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['hard_stops'] += 1
                 
-                # タイムストップ: 爆発を狙って買ったのに、8日経っても建値付近でウロウロしているなら「不発弾」と見なす
-                if pos['days_held'] >= 8 and curr_c <= (pos['entry_p'] * 1.02) and exit_score == 0: 
+                # タイムストップ: 8日 -> 12日へ延長。出来高ブレイク後の調整（ヨコヨコ）を許容して待つ。
+                if pos['days_held'] >= 12 and curr_c <= (pos['entry_p'] * 1.05) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
 
@@ -527,12 +531,11 @@ def run_integrity_tests() -> None:
     res_df = SmallCapStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    # 【テスト修正】VCPブレイクアウトの条件を満たすダミーデータに変更
     dummy_row_ok = {
         'close': 1050.0, 'ma50': 1000.0, 'ma200': 900.0,
-        'bb_width': 0.08, 'bb_width_min': 0.08, # ボラティリティ収縮（スクイーズ）
-        'vol_ratio': 4.0, 'is_bullish': True, 'close_position': 0.9, # 出来高急増の大陽線引け
-        'market_healthy': True
+        'bb_width': 0.08, 'bb_width_min': 0.08, 
+        'vol_ratio': 4.0, 'is_bullish': True, 'close_position': 0.9, 
+        'market_healthy': True, 'rs_21': 5.0 # 追加したRS条件を満たす
     }
     dummy_fund_ok = {'roe': 12.0, 'equity_ratio': 55.0}
     try:
@@ -603,9 +606,9 @@ if __name__ == "__main__":
         print(f" 🔬 VCPスクイーズ・ブレイクアウト 分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
-        print(f" [3] トレイリングストップ(利大確定): {st['trailing_stops']} 回")
-        print(f" [4] ハードストップ(損小撤退): {st['hard_stops']} 回")
-        print(f" [5] 不発弾の撤退(8日経過): {st['time_stops']} 回")
+        print(f" [3] トレイリングストップ(大波ホールド): {st['trailing_stops']} 回")
+        print(f" [4] ハードストップ(安値割れ撤退): {st['hard_stops']} 回")
+        print(f" [5] 不発弾の撤退(12日経過): {st['time_stops']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
