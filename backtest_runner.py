@@ -257,7 +257,6 @@ class SmallCapStrategyAnalyzer:
             benchmark_df['bm_ma25'] = benchmark_df['close'].rolling(window=25).mean()
             benchmark_df['bm_ma50'] = benchmark_df['close'].rolling(window=50).mean()
             
-            # TOPIXが50日線を上回っているかを判定用データとして保持
             benchmark_df['market_healthy'] = (benchmark_df['close'] > benchmark_df['bm_ma50'])
             
             df = df.merge(benchmark_df[['date', 'market_healthy']], on='date', how='left')
@@ -297,7 +296,6 @@ class SmallCapStrategyAnalyzer:
 
         score = 0.0
         
-        # 158%を叩き出したエントリーロジックを継承
         if curr_c > ma50_val and ma50_val > ma200_val:
             if bb_width <= 0.25:
                 if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and rs_21 > 0.0 and rsi < 80.0:
@@ -442,7 +440,7 @@ class SmallCapPortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
 
-                # 1. テイクプロフィット (+25%)
+                # 1. テイクプロフィット (+25% または RSI 85以上)
                 if (curr_c >= pos['entry_p'] * 1.25 or rsi >= 85.0) and exit_score == 0:
                     exit_score += 100
                     self.stats['take_profit'] += 1
@@ -451,7 +449,7 @@ class SmallCapPortfolioBacktester:
                 if pos['high_p'] >= pos['entry_p'] + (current_atr * 2.0):
                     pos['breakeven_active'] = True
 
-                # 3. ハードストップ
+                # 3. ハードストップ (2.0 ATR)
                 hard_stop_price = pos['entry_p'] - (current_atr * 2.0)
                 if pos['swing_low'] > 0:
                     hard_stop_price = min(hard_stop_price, pos['swing_low'] * 0.98) 
@@ -466,25 +464,14 @@ class SmallCapPortfolioBacktester:
                     else:
                         self.stats['hard_stops'] += 1
                         
-                # 4. 【NEW】段階的トレイリングストップ
-                # 利益が+15%を超えたら、ストップを 1.5 ATR に引き締めて利益をロックする。
-                # それ未満は 2.5 ATR でゆとりを持たせる。
-                if pos['high_p'] >= pos['entry_p'] * 1.15:
-                    trailing_stop_price = pos['high_p'] - (current_atr * 1.5)
-                else:
-                    trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
-                    
+                # 4. トレイリングストップ (158%時の完全復元：2.5 ATR固定)
+                trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                # 5. 【NEW】ハイブリッド・タイムストップ
-                # 5日経過して「含み損（建値未満）」なら即切りし、不要なダメージを回避
-                if pos['days_held'] >= 5 and curr_c < pos['entry_p'] and exit_score == 0: 
-                    exit_score += 100
-                    self.stats['time_stops'] += 1
-                # 8日経過して「建値+2%以下」でうじうじしている場合も撤退
-                elif pos['days_held'] >= 8 and curr_c <= (pos['entry_p'] * 1.02) and exit_score == 0:
+                # 5. タイムストップ (158%時の完全復元：8日経過かつ建値+2%以下)
+                if pos['days_held'] >= 8 and curr_c <= (pos['entry_p'] * 1.02) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
 
@@ -496,7 +483,7 @@ class SmallCapPortfolioBacktester:
             for ct in closed_tickers:
                 del positions[ct]
 
-            # 動的ポジションサイジング（158%を叩き出した設定を継承）
+            # 動的ポジションサイジング
             open_slots = self.max_positions - len(positions)
             
             if open_slots > 0 and cash > 0 and vix < 25.0:
@@ -627,7 +614,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 SMALL CAP SIMULATION RESULTS (HYBRID EXIT VCP)")
+        print(f" 📊 SMALL CAP SIMULATION RESULTS (DYNAMIC SIZING VCP - RESTORED)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -640,15 +627,15 @@ if __name__ == "__main__":
         exec_rate = (st['orders_exec'] / st['orders_placed']) * 100 if st['orders_placed'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 ハイブリッド・エグジット 分析レポート")
+        print(f" 🔬 動的資金管理・最高益復元レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f" [2] ギャップ回避: {st['gap_cancels']} 回")
         print(f" [3] 防御モード(半量)発動: {st['half_size_entries']} 回")
-        print(f" [4] クライマックス利確: {st['take_profit']} 回")
-        print(f" [5] 段階的トレイリング: {st['trailing_stops']} 回")
+        print(f" [4] クライマックス利確(+25%): {st['take_profit']} 回")
+        print(f" [5] トレイリングストップ(2.5 ATR): {st['trailing_stops']} 回")
         print(f" [6] 建値ストップ: {st['breakeven_stops']} 回")
         print(f" [7] ハードストップ: {st['hard_stops']} 回")
-        print(f" [8] ハイブリッド・タイム撤退: {st['time_stops']} 回")
+        print(f" [8] タイムストップ撤退(8日): {st['time_stops']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
