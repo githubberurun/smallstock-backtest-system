@@ -261,7 +261,6 @@ class SmallCapStrategyAnalyzer:
             df = df.merge(benchmark_df[['date', 'market_healthy']], on='date', how='left')
             df['market_healthy'] = df['market_healthy'].ffill().fillna(False)
             
-            # 【復活】市場（ベンチマーク）と比較した相対強度（Relative Strength）
             df = df.merge(benchmark_df[['date', 'close']], on='date', how='left', suffixes=('', '_bm'))
             df['close_bm'] = df['close_bm'].ffill()
             df['rs_21'] = (df['close'].pct_change(21) - df['close_bm'].pct_change(21)) * 100
@@ -301,10 +300,9 @@ class SmallCapStrategyAnalyzer:
 
         score = 0.0
         
-        # VCP スクイーズ・ブレイクアウト + 相対強度の確認
+        # エントリーロジックは完璧に機能しているため一切変更なし
         if curr_c > ma200_val and ma50_val > ma200_val:
             if bb_width <= (bb_width_min * 1.2) or bb_width <= 0.10:
-                # 【追加入件】市場平均に勝っている「本物の強い銘柄（rs_21 > 0.0）」のみをピックアップ
                 if vol_ratio >= 3.0 and is_bullish and close_pos >= 0.8 and rs_21 > 0.0:
                     score += 100.0
                 
@@ -354,7 +352,7 @@ class SmallCapPortfolioBacktester:
         self.stats = {
             'orders_placed': 0, 'orders_exec': 0,
             'trailing_stops': 0, 'hard_stops': 0,
-            'time_stops': 0, 'gap_cancels': 0
+            'breakeven_stops': 0, 'time_stops': 0, 'gap_cancels': 0
         }
         
         debug_log("Loading and calculating indicators for SMALL CAP tickers...")
@@ -422,7 +420,8 @@ class SmallCapPortfolioBacktester:
                         cash -= qty * exec_price
                         positions[ticker] = {
                             'qty': qty, 'entry_p': exec_price, 'high_p': exec_price, 
-                            'days_held': 0, 'swing_low': lowest_5
+                            'days_held': 0, 'swing_low': lowest_5,
+                            'breakeven_active': False # 新規: 建値ストップフラグ
                         }
                         self.stats['orders_exec'] += 1
             pending_orders = new_pending
@@ -439,24 +438,37 @@ class SmallCapPortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
                 
-                # 【エグジット大幅緩和（ホールド力の強化）】
-                # トレイリングストップ: 2.0 ATR -> 3.0 ATR に拡大。ふるい落としに耐え、大波に乗る。
-                trailing_stop_price = pos['high_p'] - (current_atr * 3.0)
-                if curr_c <= trailing_stop_price and exit_score == 0:
-                    exit_score += 100
-                    self.stats['trailing_stops'] += 1
-                    
-                # ハードストップ: 1.5 ATR -> 2.0 ATR へ緩和。かつ、直近の「最安値」を割ったかどうかを最重視する。
-                hard_stop_price = pos['entry_p'] - (current_atr * 2.0)
+                # 【新設：フリーロール化】
+                # 株価がエントリーから 1.0 ATR 分上昇したら、ストップを建値(+手数料分)に引き上げる
+                if pos['high_p'] >= pos['entry_p'] + current_atr:
+                    pos['breakeven_active'] = True
+
+                # 【修正：ハードストップ＆建値ストップ】
+                hard_stop_price = pos['entry_p'] - (current_atr * 1.5)
                 if pos['swing_low'] > 0:
-                    hard_stop_price = min(hard_stop_price, pos['swing_low'] * 0.98) # 安値のさらに2%下
+                    hard_stop_price = min(hard_stop_price, pos['swing_low'] * 0.98) 
+                
+                # フリーロール発動中は、絶対に損しないラインで撤退
+                if pos.get('breakeven_active', False):
+                    hard_stop_price = max(hard_stop_price, pos['entry_p'] * 1.005) 
                 
                 if curr_c <= hard_stop_price and exit_score == 0:
                     exit_score += 100
-                    self.stats['hard_stops'] += 1
+                    if pos.get('breakeven_active', False):
+                        self.stats['breakeven_stops'] += 1
+                    else:
+                        self.stats['hard_stops'] += 1
+                        
+                # 【修正：トレイリングストップの適正化】
+                # 3.0 ATRは返しすぎなので 1.5 ATR に引き締め、急騰後の急落を利益でロックする
+                trailing_stop_price = pos['high_p'] - (current_atr * 1.5)
+                if curr_c <= trailing_stop_price and exit_score == 0:
+                    exit_score += 100
+                    self.stats['trailing_stops'] += 1
                 
-                # タイムストップ: 8日 -> 12日へ延長。出来高ブレイク後の調整（ヨコヨコ）を許容して待つ。
-                if pos['days_held'] >= 12 and curr_c <= (pos['entry_p'] * 1.05) and exit_score == 0: 
+                # 【修正：不発弾の即切り】
+                # 12日間も資金を寝かせない。ブレイクして5日経っても建値付近ならダマシ。即資金回収。
+                if pos['days_held'] >= 5 and curr_c <= (pos['entry_p'] * 1.02) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
 
@@ -535,7 +547,7 @@ def run_integrity_tests() -> None:
         'close': 1050.0, 'ma50': 1000.0, 'ma200': 900.0,
         'bb_width': 0.08, 'bb_width_min': 0.08, 
         'vol_ratio': 4.0, 'is_bullish': True, 'close_position': 0.9, 
-        'market_healthy': True, 'rs_21': 5.0 # 追加したRS条件を満たす
+        'market_healthy': True, 'rs_21': 5.0 
     }
     dummy_fund_ok = {'roe': 12.0, 'equity_ratio': 55.0}
     try:
@@ -590,7 +602,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 SMALL CAP SIMULATION RESULTS (VCP BREAKOUT STRATEGY)")
+        print(f" 📊 SMALL CAP SIMULATION RESULTS (VCP PRO STRATEGY)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -603,12 +615,13 @@ if __name__ == "__main__":
         exec_rate = (st['orders_exec'] / st['orders_placed']) * 100 if st['orders_placed'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 VCPスクイーズ・ブレイクアウト 分析レポート")
+        print(f" 🔬 プロ水準資金管理・分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
-        print(f" [3] トレイリングストップ(大波ホールド): {st['trailing_stops']} 回")
-        print(f" [4] ハードストップ(安値割れ撤退): {st['hard_stops']} 回")
-        print(f" [5] 不発弾の撤退(12日経過): {st['time_stops']} 回")
+        print(f" [3] 建値ストップ(無敗撤退): {st['breakeven_stops']} 回")
+        print(f" [4] ハードストップ(損小撤退): {st['hard_stops']} 回")
+        print(f" [5] トレイリングストップ(利益確保): {st['trailing_stops']} 回")
+        print(f" [6] 不発弾の即切り(5日経過): {st['time_stops']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
