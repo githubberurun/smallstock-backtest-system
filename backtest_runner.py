@@ -190,7 +190,7 @@ class FundamentalCache:
         return {'roe': roe, 'equity_ratio': equity_ratio}
 
 # ==========================================
-# 3. 小型株専用・統合分析エンジン (High-Frequency VCP + True Restored)
+# 3. 小型株専用・統合分析エンジン (High-Purity VCP APEX)
 # ==========================================
 class SmallCapStrategyAnalyzer:
     @staticmethod
@@ -257,7 +257,7 @@ class SmallCapStrategyAnalyzer:
             benchmark_df['bm_ma25'] = benchmark_df['close'].rolling(window=25).mean()
             benchmark_df['bm_ma50'] = benchmark_df['close'].rolling(window=50).mean()
             
-            # TOPIXが50日線を上回っているか（地合いフィルター）
+            # TOPIXが50日線を上回っているか（地合いフィルター継続）
             benchmark_df['market_healthy'] = (benchmark_df['close'] > benchmark_df['bm_ma50'])
             
             df = df.merge(benchmark_df[['date', 'market_healthy']], on='date', how='left')
@@ -279,7 +279,8 @@ class SmallCapStrategyAnalyzer:
         
         market_healthy = bool(row_dict.get('market_healthy', True))
         
-        if not market_healthy or vix >= 25.0:
+        # 【MDDキラー①】VIX上限を25.0から「20.0」へ厳格化。嵐の気配があるときは完全撤退。
+        if not market_healthy or vix >= 20.0:
             return False, 0.0, False
             
         roe = SmallCapStrategyAnalyzer._to_float(fund_data.get('roe', 0.0))
@@ -302,10 +303,11 @@ class SmallCapStrategyAnalyzer:
 
         score = 0.0
         
-        # エントリーロジック（138%時と同一）
         if curr_c > ma50_val and ma50_val > ma200_val:
             if bb_width <= 0.25:
-                if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and rs_21 > 0.0 and rsi < 80.0:
+                # 【MDDキラー②】close_pos >= 0.85 (ほぼ高値引けのみ承認。上ヒゲによるダマシを完全排除)
+                # 【MDDキラー③】rs_21 > 5.0 (TOPIXを5%以上アウトパフォームしている本物の主役のみ承認)
+                if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.85 and rs_21 > 5.0 and rsi < 80.0:
                     score += 100.0
                 
         is_entry = (score >= 100.0) 
@@ -441,16 +443,14 @@ class SmallCapPortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
 
-                # 1. テイクプロフィット: 138%時の完全設定 (+25%)
+                # エグジットは138%時の最高効率設定を完全維持
                 if (curr_c >= pos['entry_p'] * 1.25 or rsi >= 85.0) and exit_score == 0:
                     exit_score += 100
                     self.stats['take_profit'] += 1
 
-                # 2. フリーロール発動: 2.0 ATR
                 if pos['high_p'] >= pos['entry_p'] + (current_atr * 2.0):
                     pos['breakeven_active'] = True
 
-                # 3. ハードストップ: 138%時の完全設定 (2.0 ATR)
                 hard_stop_price = pos['entry_p'] - (current_atr * 2.0)
                 if pos['swing_low'] > 0:
                     hard_stop_price = min(hard_stop_price, pos['swing_low'] * 0.98) 
@@ -465,13 +465,11 @@ class SmallCapPortfolioBacktester:
                     else:
                         self.stats['hard_stops'] += 1
                         
-                # 4. トレイリングストップ: 【絶対的復元】 2.5 ATR (ノイズを許容し大波に乗る)
                 trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
-                # 5. タイムストップ: 138%時の完全設定 (8日経過かつ建値+2%以下で撤退)
                 if pos['days_held'] >= 8 and curr_c <= (pos['entry_p'] * 1.02) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
@@ -547,14 +545,16 @@ def run_integrity_tests() -> None:
     res_df = SmallCapStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
+    # テスト条件を厳格化されたフィルター(VIX<20, close_pos>=0.85, rs_21>5.0)に適合させる
     dummy_row_ok = {
         'close': 1050.0, 'ma50': 1000.0, 'ma200': 900.0,
         'bb_width': 0.20, 'bb_width_min': 0.18, 
-        'vol_ratio': 2.5, 'is_bullish': True, 'close_position': 0.8, 
-        'market_healthy': True, 'rs_21': 5.0, 'rsi': 65.0
+        'vol_ratio': 2.5, 'is_bullish': True, 'close_position': 0.90, 
+        'market_healthy': True, 'rs_21': 6.0, 'rsi': 65.0
     }
     dummy_fund_ok = {'roe': 12.0, 'equity_ratio': 55.0}
     try:
+        # vixを15.0(安全水準)として評価
         is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, 0.0, 15.0, dummy_fund_ok)
         assert isinstance(score, float)
         assert is_entry is True, "Valid Scaled VCP Breakout row should return True"
@@ -606,7 +606,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 SMALL CAP SIMULATION RESULTS (TRUE RESTORED VCP STRATEGY)")
+        print(f" 📊 SMALL CAP SIMULATION RESULTS (APEX VCP STRATEGY)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -619,7 +619,7 @@ if __name__ == "__main__":
         exec_rate = (st['orders_exec'] / st['orders_placed']) * 100 if st['orders_placed'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 真・138%完全復元 分析レポート")
+        print(f" 🔬 高純度スナイパー・分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
         print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
         print(f" [3] クライマックス利確(+25%超): {st['take_profit']} 回")
