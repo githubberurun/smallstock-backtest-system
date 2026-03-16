@@ -190,7 +190,7 @@ class FundamentalCache:
         return {'roe': roe, 'equity_ratio': equity_ratio}
 
 # ==========================================
-# 3. 小型株専用・統合分析エンジン (High-Purity VCP APEX)
+# 3. 小型株専用・統合分析エンジン (138% Base Logic)
 # ==========================================
 class SmallCapStrategyAnalyzer:
     @staticmethod
@@ -257,7 +257,7 @@ class SmallCapStrategyAnalyzer:
             benchmark_df['bm_ma25'] = benchmark_df['close'].rolling(window=25).mean()
             benchmark_df['bm_ma50'] = benchmark_df['close'].rolling(window=50).mean()
             
-            # TOPIXが50日線を上回っているか（地合いフィルター継続）
+            # TOPIXが50日線を上回っているかを判定用データとして保持（フィルタリングは資金管理側で行う）
             benchmark_df['market_healthy'] = (benchmark_df['close'] > benchmark_df['bm_ma50'])
             
             df = df.merge(benchmark_df[['date', 'market_healthy']], on='date', how='left')
@@ -273,16 +273,10 @@ class SmallCapStrategyAnalyzer:
         return df
 
     @staticmethod
-    def evaluate_entry(row_dict: Dict[str, Any], n_chg: float, vix: float, fund_data: Dict[str, float]) -> Tuple[bool, float, bool]:
+    def evaluate_entry(row_dict: Dict[str, Any], fund_data: Dict[str, float]) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         if not isinstance(fund_data, dict): raise TypeError("fund_data must be a dictionary")
         
-        market_healthy = bool(row_dict.get('market_healthy', True))
-        
-        # 【MDDキラー①】VIX上限を25.0から「20.0」へ厳格化。嵐の気配があるときは完全撤退。
-        if not market_healthy or vix >= 20.0:
-            return False, 0.0, False
-            
         roe = SmallCapStrategyAnalyzer._to_float(fund_data.get('roe', 0.0))
         eq_ratio = SmallCapStrategyAnalyzer._to_float(fund_data.get('equity_ratio', 0.0))
         
@@ -303,11 +297,10 @@ class SmallCapStrategyAnalyzer:
 
         score = 0.0
         
+        # 【138%爆発エンジン】エントリー基準は最高効率（取引回数480回水準）のものに固定
         if curr_c > ma50_val and ma50_val > ma200_val:
             if bb_width <= 0.25:
-                # 【MDDキラー②】close_pos >= 0.85 (ほぼ高値引けのみ承認。上ヒゲによるダマシを完全排除)
-                # 【MDDキラー③】rs_21 > 5.0 (TOPIXを5%以上アウトパフォームしている本物の主役のみ承認)
-                if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.85 and rs_21 > 5.0 and rsi < 80.0:
+                if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and rs_21 > 0.0 and rsi < 80.0:
                     score += 100.0
                 
         is_entry = (score >= 100.0) 
@@ -356,7 +349,8 @@ class SmallCapPortfolioBacktester:
         self.stats = {
             'orders_placed': 0, 'orders_exec': 0,
             'take_profit': 0, 'trailing_stops': 0, 'hard_stops': 0,
-            'breakeven_stops': 0, 'time_stops': 0, 'gap_cancels': 0
+            'breakeven_stops': 0, 'time_stops': 0, 'gap_cancels': 0,
+            'half_size_entries': 0 # 新規: 動的資金管理による半量エントリー回数
         }
         
         debug_log("Loading and calculating indicators for SMALL CAP tickers...")
@@ -401,6 +395,12 @@ class SmallCapPortfolioBacktester:
             
             current_total_equity = cash + sum([p['qty'] * SmallCapStrategyAnalyzer._to_float(today_market.get(t, {}).get('close', p['entry_p'])) for t, p in positions.items()])
             
+            # その日の相場の健康状態をチェック（どの銘柄でも同じ値が入っている）
+            is_market_healthy = True
+            if today_market:
+                first_ticker = list(today_market.keys())[0]
+                is_market_healthy = bool(today_market[first_ticker].get('market_healthy', True))
+
             new_pending = []
             for order in pending_orders:
                 ticker = order['ticker']
@@ -443,7 +443,7 @@ class SmallCapPortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
 
-                # エグジットは138%時の最高効率設定を完全維持
+                # 138%エンジンのエグジット（完全維持）
                 if (curr_c >= pos['entry_p'] * 1.25 or rsi >= 85.0) and exit_score == 0:
                     exit_score += 100
                     self.stats['take_profit'] += 1
@@ -482,14 +482,24 @@ class SmallCapPortfolioBacktester:
             for ct in closed_tickers:
                 del positions[ct]
 
+            # 【真のMDDキラー：動的ポジションサイジング（可変レバレッジ）】
             open_slots = self.max_positions - len(positions)
-            if open_slots > 0 and cash > 0:
+            
+            # VIXが25以上のパニック相場では新規エントリーを見送る（暴落回避）
+            if open_slots > 0 and cash > 0 and vix < 25.0:
+                
+                # リスク係数の算出：地合いが悪い、またはVIXが高い時は投資額を「半分（0.5）」にする
+                risk_multiplier = 1.0
+                if not is_market_healthy or vix >= 20.0:
+                    risk_multiplier = 0.5
+                
                 candidates = []
                 for ticker, row in today_market.items():
                     if ticker in positions: continue 
                     
                     fund_data = self.fund_cache.get_fundamentals(ticker)
-                    is_entry, score, is_high_risk = SmallCapStrategyAnalyzer.evaluate_entry(row, n_chg, vix, fund_data)
+                    # 評価関数からはVIXと地合いフィルターを外し、ロジック純度のみで判定
+                    is_entry, score, is_high_risk = SmallCapStrategyAnalyzer.evaluate_entry(row, fund_data)
                     
                     if is_entry:
                         candidates.append((score, ticker))
@@ -498,13 +508,17 @@ class SmallCapPortfolioBacktester:
                 allowed_slots_today = min(open_slots, self.max_positions)
                 
                 for score, ticker in candidates[:allowed_slots_today]:
-                    max_alloc_per_trade = current_total_equity * (1.0 / self.max_positions)
+                    # 基本の投資枠（総資産の20%）にリスク係数を掛ける
+                    max_alloc_per_trade = (current_total_equity * (1.0 / self.max_positions)) * risk_multiplier
                     target_alloc = min(cash / open_slots, max_alloc_per_trade)
                     
                     pending_orders.append({
                         'ticker': ticker,
                         'allocated_cash': target_alloc
                     })
+                    if risk_multiplier == 0.5:
+                        self.stats['half_size_entries'] += 1
+                    
                     open_slots -= 1
 
             daily_equity = cash
@@ -545,17 +559,15 @@ def run_integrity_tests() -> None:
     res_df = SmallCapStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    # テスト条件を厳格化されたフィルター(VIX<20, close_pos>=0.85, rs_21>5.0)に適合させる
     dummy_row_ok = {
         'close': 1050.0, 'ma50': 1000.0, 'ma200': 900.0,
         'bb_width': 0.20, 'bb_width_min': 0.18, 
-        'vol_ratio': 2.5, 'is_bullish': True, 'close_position': 0.90, 
-        'market_healthy': True, 'rs_21': 6.0, 'rsi': 65.0
+        'vol_ratio': 2.5, 'is_bullish': True, 'close_position': 0.8, 
+        'market_healthy': True, 'rs_21': 5.0, 'rsi': 65.0
     }
     dummy_fund_ok = {'roe': 12.0, 'equity_ratio': 55.0}
     try:
-        # vixを15.0(安全水準)として評価
-        is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, 0.0, 15.0, dummy_fund_ok)
+        is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, dummy_fund_ok)
         assert isinstance(score, float)
         assert is_entry is True, "Valid Scaled VCP Breakout row should return True"
     except Exception as e:
@@ -563,7 +575,7 @@ def run_integrity_tests() -> None:
 
     dummy_fund_bad = {'roe': 5.0, 'equity_ratio': 60.0}
     try:
-        is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, 0.0, 15.0, dummy_fund_bad)
+        is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, dummy_fund_bad)
         assert is_entry is False, "Zombie company must be rejected"
     except Exception as e:
         raise AssertionError(f"Failed handling zombie data: {e}")
@@ -571,7 +583,7 @@ def run_integrity_tests() -> None:
     dummy_row_err = {'ma200': np.nan, 'vol_ratio': 'invalid', 'market_healthy': 'error'}
     dummy_fund_err = {'roe': None, 'equity_ratio': 'error'}
     try:
-        is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_err, 0.0, 15.0, dummy_fund_err)
+        is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_err, dummy_fund_err)
         assert isinstance(score, float)
         assert is_entry is False
     except Exception as e:
@@ -606,7 +618,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 SMALL CAP SIMULATION RESULTS (APEX VCP STRATEGY)")
+        print(f" 📊 SMALL CAP SIMULATION RESULTS (DYNAMIC SIZING VCP)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -619,14 +631,15 @@ if __name__ == "__main__":
         exec_rate = (st['orders_exec'] / st['orders_placed']) * 100 if st['orders_placed'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 高純度スナイパー・分析レポート")
+        print(f" 🔬 動的資金管理・分析レポート")
         print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
-        print(f" [2] ギャップ（窓開け）回避: {st['gap_cancels']} 回")
-        print(f" [3] クライマックス利確(+25%超): {st['take_profit']} 回")
-        print(f" [4] トレイリングストップ(大波ホールド): {st['trailing_stops']} 回")
-        print(f" [5] 建値ストップ(無敗撤退): {st['breakeven_stops']} 回")
-        print(f" [6] ハードストップ(損小撤退): {st['hard_stops']} 回")
-        print(f" [7] 不発弾の撤退(8日経過/含み損): {st['time_stops']} 回")
+        print(f" [2] ギャップ回避: {st['gap_cancels']} 回")
+        print(f" [3] 防御モード(半量)発動: {st['half_size_entries']} 回")
+        print(f" [4] クライマックス利確: {st['take_profit']} 回")
+        print(f" [5] トレイリングストップ: {st['trailing_stops']} 回")
+        print(f" [6] 建値ストップ: {st['breakeven_stops']} 回")
+        print(f" [7] ハードストップ: {st['hard_stops']} 回")
+        print(f" [8] タイムストップ撤退: {st['time_stops']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
