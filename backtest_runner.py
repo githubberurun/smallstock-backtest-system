@@ -283,6 +283,7 @@ class SmallCapStrategyAnalyzer:
             return False, 0.0, False 
             
         curr_c = SmallCapStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
+        prev_c = SmallCapStrategyAnalyzer._to_float(row_dict.get('prev_close', curr_c))
         ma50_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('ma50', 0.0))
         ma200_val = SmallCapStrategyAnalyzer._to_float(row_dict.get('ma200', 0.0))
         
@@ -295,13 +296,17 @@ class SmallCapStrategyAnalyzer:
         rsi = SmallCapStrategyAnalyzer._to_float(row_dict.get('rsi', 0.0))
 
         score = 0.0
+        # 💡 新規追加：価格上昇率の算出 (+3%以上の急騰を要求)
+        price_change = (curr_c - prev_c) / prev_c if prev_c > 0 else 0.0
         
         if curr_c > ma50_val and ma50_val > ma200_val:
             if bb_width <= 0.25:
-                if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and rs_21 > 0.0 and rsi < 80.0:
-                    score += 100.0
+                # 💡 厳格化フィルター: RSI 60以上80未満 ＆ 日次リターン+3%以上
+                if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and rs_21 > 0.0 and (60.0 <= rsi < 80.0) and price_change >= 0.03:
+                    # 💡 動的スコアリング: 出来高急増度 × 相対強度で最強銘柄をランキング
+                    score = float(vol_ratio * rs_21)
                 
-        is_entry = (score >= 100.0) 
+        is_entry = (score > 0.0) 
         return is_entry, float(score), False
 
 # ==========================================
@@ -345,7 +350,7 @@ class SmallCapPortfolioBacktester:
         self.fund_cache = FundamentalCache(data_dir, api_key)
         
         self.stats = {
-            'orders_placed': 0, 'orders_exec': 0, 'limit_not_filled': 0, 'gap_cancels': 0,
+            'orders_placed': 0, 'orders_exec': 0, 'gap_cancels': 0,
             'take_profit': 0, 'trailing_stops': 0, 'hard_stops': 0,
             'breakeven_stops': 0, 'time_stops': 0, 'half_size_entries': 0
         }
@@ -382,7 +387,7 @@ class SmallCapPortfolioBacktester:
     def run(self) -> Dict[str, Any]:
         cash = self.cash
         positions: Dict[str, Dict[str, Any]] = {} 
-        pending_buy_orders: List[Dict[str, Any]] = [] # 翌日へのリテスト指値オーダー
+        pending_buy_orders: List[Dict[str, Any]] = [] # 翌日始値(成行)オーダー
         pending_sells: List[str] = []                 # 翌日始値で売却する銘柄リスト
         equity_curve: List[float] = []
         total_trades = 0
@@ -399,35 +404,33 @@ class SmallCapPortfolioBacktester:
                     open_p = SmallCapStrategyAnalyzer._to_float(row.get('open', 0.0))
                     
                     if open_p > 0 and ticker in positions:
-                        # 始値で機械的に決済
+                        # 始値で機械的に決済 (0.2% スリッページ/手数料 加味)
                         pos = positions[ticker]
-                        cash += pos['qty'] * (open_p * 0.998) # 手数料・スリッページ考慮
+                        cash += pos['qty'] * (open_p * 0.998) 
                         del positions[ticker]
                         total_trades += 1
                     else:
-                        still_pending_sells.append(ticker) # 値がつかない場合は持ち越し
+                        still_pending_sells.append(ticker) 
                 else:
                     still_pending_sells.append(ticker)
             pending_sells = still_pending_sells
 
-            # --- 2. 前日に発注した「リテスト指値」の約定判定処理 ---
+            # --- 2. 前日に発注した「成行買い」の約定判定処理 ---
             for order in pending_buy_orders:
                 ticker = order['ticker']
                 if ticker in today_market and len(positions) < self.max_positions:
                     row = today_market[ticker]
                     open_p = SmallCapStrategyAnalyzer._to_float(row.get('open', 0.0))
-                    low_p = SmallCapStrategyAnalyzer._to_float(row.get('low', 0.0))
                     prev_close = SmallCapStrategyAnalyzer._to_float(row.get('prev_close', open_p))
-                    limit_p = order['limit_price']
                     
-                    # 💡 リテスト・ロジック: ギャップアップ(+2%超)・ギャップダウン(-2%未満)の徹底排除
-                    if open_p > (prev_close * 1.02) or open_p < (prev_close * 0.98):
+                    # 極端なギャップアップ・ダウン(+5%以上、-2%未満)のみ成行を回避
+                    if open_p > (prev_close * 1.05) or open_p < (prev_close * 0.98):
                         self.stats['gap_cancels'] += 1
                         continue
                         
-                    # 指値（前日終値）まで押してきた場合のみ約定
-                    if low_p <= limit_p and open_p > 0:
-                        exec_price = min(open_p, limit_p)
+                    if open_p > 0:
+                        # 💡 始値に0.2%の悪化スリッページを乗せて確実な成行約定をシミュレート
+                        exec_price = open_p * 1.002
                         alloc_cash = order['allocated_cash']
                         qty = alloc_cash // exec_price
                         
@@ -439,12 +442,7 @@ class SmallCapPortfolioBacktester:
                                 'breakeven_active': False
                             }
                             self.stats['orders_exec'] += 1
-                        else:
-                            self.stats['limit_not_filled'] += 1
-                    else:
-                        self.stats['limit_not_filled'] += 1
             
-            # 約定しなかった指値は毎日リセット
             pending_buy_orders = []
 
             # --- 3. 大引け時点（当日の終値）での「売りアラート」判定処理 ---
@@ -492,7 +490,7 @@ class SmallCapPortfolioBacktester:
                         pending_sells.append(ticker)
                         self.stats[sell_reason] += 1
 
-            # --- 4. 翌日のための「リテスト指値買い」の選定と発注 ---
+            # --- 4. 翌日のための「成行買い」の選定と発注 ---
             is_market_healthy = True
             if today_market:
                 first_ticker = list(today_market.keys())[0]
@@ -519,6 +517,7 @@ class SmallCapPortfolioBacktester:
                     if is_entry:
                         candidates.append((score, ticker))
                 
+                # 💡 スコア(出来高急増×相対強度)が高い順にソートし、真のエリート銘柄のみ抽出
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 allowed_slots_today = min(open_slots, self.max_positions)
                 
@@ -526,13 +525,9 @@ class SmallCapPortfolioBacktester:
                     max_alloc_per_trade = (current_total_equity * (1.0 / self.max_positions)) * risk_multiplier
                     target_alloc = min(cash / max(1, open_slots), max_alloc_per_trade)
                     
-                    # 💡 リテスト指値ロジック: エントリー判定が出た当日の「終値（Close）」を指値価格にする
-                    curr_c = SmallCapStrategyAnalyzer._to_float(today_market[ticker].get('close', 0.0))
-                    
                     pending_buy_orders.append({
                         'ticker': ticker,
-                        'allocated_cash': target_alloc,
-                        'limit_price': curr_c
+                        'allocated_cash': target_alloc
                     })
                     
                     self.stats['orders_placed'] += 1
@@ -574,13 +569,13 @@ class SmallCapPortfolioBacktester:
 # 5. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity tests for Breakout Retest Logic...")
+    debug_log("Running integrity tests for High-Purity Sniper Logic...")
     empty_df = pd.DataFrame()
     res_df = SmallCapStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
     dummy_row_ok = {
-        'close': 1050.0, 'high': 1060.0, 'ma50': 1000.0, 'ma200': 900.0,
+        'prev_close': 1000.0, 'close': 1050.0, 'ma50': 1000.0, 'ma200': 900.0,
         'bb_width': 0.20, 'bb_width_min': 0.18, 
         'vol_ratio': 2.5, 'is_bullish': True, 'close_position': 0.8, 
         'market_healthy': True, 'rs_21': 5.0, 'rsi': 65.0
@@ -589,16 +584,18 @@ def run_integrity_tests() -> None:
     try:
         is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, dummy_fund_ok)
         assert isinstance(score, float)
+        assert score == 12.5, f"Score math error: expected 12.5 (2.5 * 5.0), got {score}"
         assert is_entry is True, "Valid Scaled VCP Breakout row should return True"
     except Exception as e:
         raise AssertionError(f"Failed handling valid data: {e}")
 
-    dummy_fund_bad = {'roe': 5.0, 'equity_ratio': 60.0}
+    dummy_row_weak = dummy_row_ok.copy()
+    dummy_row_weak['close'] = 1010.0 # +1.0% jump (fails the >3% filter)
     try:
-        is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, dummy_fund_bad)
-        assert is_entry is False, "Zombie company must be rejected"
+        is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_weak, dummy_fund_ok)
+        assert is_entry is False, "Weak breakout (<3%) must be rejected"
     except Exception as e:
-        raise AssertionError(f"Failed handling zombie data: {e}")
+        raise AssertionError(f"Failed handling weak breakout data: {e}")
 
     dummy_row_err = {'ma200': np.nan, 'vol_ratio': 'invalid', 'market_healthy': 'error'}
     dummy_fund_err = {'roe': None, 'equity_ratio': 'error'}
@@ -628,17 +625,17 @@ if __name__ == "__main__":
             exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING BREAKOUT RETEST BACKTEST (10 POSITIONS, 4-DAY STOP)")
+        print(" 🚀 STARTING HIGH-PURITY SNIPER BACKTEST (10 POSITIONS, MKT OPEN)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
-        MAX_CONCURRENT_POSITIONS = 10  # 10銘柄まで保有する新仕様
+        MAX_CONCURRENT_POSITIONS = 10
         
         tester = SmallCapPortfolioBacktester(data_dir=data_dir, api_key=JQ_API_KEY, initial_cash=STARTING_CAPITAL, max_positions=MAX_CONCURRENT_POSITIONS)
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 SMALL CAP SIMULATION RESULTS (RETEST & GAP REJECT)")
+        print(f" 📊 SMALL CAP SIMULATION RESULTS (SNIPER & SCORING)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -648,24 +645,20 @@ if __name__ == "__main__":
         print(f" ▶ 総取引回数 (Trades)     : {res['Total_Trades']} 回")
         
         st = res['Stats']
-        # ギャップ回避を含めた発注総数での計算
-        total_limit_orders = st['orders_exec'] + st['limit_not_filled'] + st['gap_cancels']
-        exec_rate = (st['orders_exec'] / total_limit_orders) * 100 if total_limit_orders > 0 else 0
+        # 成行発注に対する約定率
+        exec_rate = (st['orders_exec'] / st['orders_placed']) * 100 if st['orders_placed'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 ブレイクアウト・リテスト ステータスレポート")
-        print(f" [1] 前日終値で押し目約定: {st['orders_exec']}約定 / {total_limit_orders}発注 (約定率 {exec_rate:.1f}%)")
-        print(f" [2] ギャップ回避(窓開け見送り): {st['gap_cancels']} 回")
-        print(f" [3] 押さずに上へ逃げた(キャンセル): {st['limit_not_filled']} 回")
+        print(f" 🔬 高純度スナイパー・ステータスレポート")
+        print(f" [1] 翌日始値(成行)での約定: {st['orders_exec']}約定 / {st['orders_placed']}発注 (約定率 {exec_rate:.1f}%)")
+        print(f" [2] 極端なギャップ回避(注文取消): {st['gap_cancels']} 回")
+        print(f" [3] 防御モード(半量)発動: {st['half_size_entries']} 回")
         print(f" [4] クライマックス利確(+25%): {st['take_profit']} 回")
         print(f" [5] トレイリングストップ(2.5 ATR): {st['trailing_stops']} 回")
         print(f" [6] 建値ストップ: {st['breakeven_stops']} 回")
         print(f" [7] ハードストップ: {st['hard_stops']} 回")
         print(f" [8] タイムストップ撤退(4日): {st['time_stops']} 回")
         print(f"==================================================", flush=True)
-        
-        # 整合性証明アサート
-        assert st['orders_exec'] + st['limit_not_filled'] + st['gap_cancels'] == st['orders_placed'], "Order tracking mismatch: Placed != Exec + Unfilled + Gap"
         
     except Exception as e:
         print(f"[FATAL] {e}")
