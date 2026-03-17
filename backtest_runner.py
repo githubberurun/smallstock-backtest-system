@@ -216,6 +216,7 @@ class SmallCapStrategyAnalyzer:
             raise KeyError(f"DataFrameに必須列が不足しています: {required_cols - set(df.columns)}")
 
         df['prev_close'] = df['close'].shift(1)
+        df['prev_high'] = df['high'].shift(1)
         
         df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma20'] = df['close'].rolling(window=20).mean()
@@ -382,7 +383,7 @@ class SmallCapPortfolioBacktester:
     def run(self) -> Dict[str, Any]:
         cash = self.cash
         positions: Dict[str, Dict[str, Any]] = {} 
-        pending_buy_orders: List[Dict[str, Any]] = [] # 翌日への買い指値オーダー
+        pending_buy_orders: List[Dict[str, Any]] = [] # 翌日への逆指値(ストップ買い)オーダー
         pending_sells: List[str] = []                 # 翌日始値で売却する銘柄リスト
         equity_curve: List[float] = []
         total_trades = 0
@@ -410,18 +411,19 @@ class SmallCapPortfolioBacktester:
                     still_pending_sells.append(ticker)
             pending_sells = still_pending_sells
 
-            # --- 2. 前日に発注した「指値」の約定判定処理 ---
+            # --- 2. 前日に発注した「逆指値（順張り）」の約定判定処理 ---
             for order in pending_buy_orders:
                 ticker = order['ticker']
                 if ticker in today_market and len(positions) < self.max_positions:
                     row = today_market[ticker]
                     open_p = SmallCapStrategyAnalyzer._to_float(row.get('open', 0.0))
-                    low_p = SmallCapStrategyAnalyzer._to_float(row.get('low', 0.0))
-                    limit_p = order['limit_price']
+                    high_p = SmallCapStrategyAnalyzer._to_float(row.get('high', 0.0))
+                    trigger_price = order['trigger_price']
                     
-                    # ギャップダウン等で始値が指値を下回っていれば始値で、そうでなければ指値で約定
-                    if low_p <= limit_p and open_p > 0:
-                        exec_price = min(open_p, limit_p)
+                    # 💡 順張りロジック: 当日高値が「前日高値（トリガー）」を上回った瞬間に飛び乗る
+                    if high_p >= trigger_price and open_p > 0:
+                        # ギャップアップで始値が既にトリガーを越えている場合は始値で約定（スリッページ）、それ以外はトリガー価格で約定
+                        exec_price = max(open_p, trigger_price)
                         alloc_cash = order['allocated_cash']
                         qty = alloc_cash // exec_price
                         
@@ -438,7 +440,7 @@ class SmallCapPortfolioBacktester:
                     else:
                         self.stats['limit_not_filled'] += 1
             
-            # 約定しなかった指値は毎日リセット（翌日に持ち越さない）
+            # 約定しなかった指値は毎日リセット（ダマシを回避し翌日に持ち越さない）
             pending_buy_orders = []
 
             # --- 3. 大引け時点（当日の終値）での「売りアラート」判定処理 ---
@@ -455,7 +457,7 @@ class SmallCapPortfolioBacktester:
                     
                     sell_reason = None
 
-                    # 判定A. テイクプロフィット
+                    # 判定A. テイクプロフィット (翌日始値売りで統一)
                     if curr_c >= pos['entry_p'] * 1.25 or rsi >= 85.0:
                         sell_reason = 'take_profit'
                     else:
@@ -473,8 +475,8 @@ class SmallCapPortfolioBacktester:
                             trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
                             if curr_c <= trailing_stop_price:
                                 sell_reason = 'trailing_stops'
-                            # 判定D. タイムストップ
-                            elif pos['days_held'] >= 8 and curr_c <= (pos['entry_p'] * 1.02):
+                            # 判定D. タイムストップ (💡 8日から「4日」へ短縮・高速回転)
+                            elif pos['days_held'] >= 4 and curr_c <= (pos['entry_p'] * 1.02):
                                 sell_reason = 'time_stops'
 
                     # フリーロール（建値確保）の発動チェック
@@ -486,7 +488,7 @@ class SmallCapPortfolioBacktester:
                         pending_sells.append(ticker)
                         self.stats[sell_reason] += 1
 
-            # --- 4. 翌日のための「指値買い」の選定と発注 ---
+            # --- 4. 翌日のための「逆指値（順張り）買い」の選定と発注 ---
             is_market_healthy = True
             if today_market:
                 first_ticker = list(today_market.keys())[0]
@@ -522,14 +524,13 @@ class SmallCapPortfolioBacktester:
                     max_alloc_per_trade = (current_total_equity * (1.0 / self.max_positions)) * risk_multiplier
                     target_alloc = min(cash / max(1, open_slots), max_alloc_per_trade)
                     
-                    # 💡 指値ロジック: 当日終値の -1.0% (小型株のふるい落としディップ買い)
-                    curr_close = SmallCapStrategyAnalyzer._to_float(today_market[ticker].get('close', 0.0))
-                    limit_price = curr_close * 0.99
+                    # 💡 逆指値ロジック: エントリー判定が出た当日の「高値（High）」を明日のトリガー価格にする
+                    curr_h = SmallCapStrategyAnalyzer._to_float(today_market[ticker].get('high', 0.0))
                     
                     pending_buy_orders.append({
                         'ticker': ticker,
                         'allocated_cash': target_alloc,
-                        'limit_price': limit_price
+                        'trigger_price': curr_h
                     })
                     
                     self.stats['orders_placed'] += 1
@@ -571,13 +572,13 @@ class SmallCapPortfolioBacktester:
 # 5. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity tests for Upgraded Limit Order Logic...")
+    debug_log("Running integrity tests for Momentum Breakout Logic...")
     empty_df = pd.DataFrame()
     res_df = SmallCapStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
     dummy_row_ok = {
-        'close': 1050.0, 'ma50': 1000.0, 'ma200': 900.0,
+        'close': 1050.0, 'high': 1060.0, 'ma50': 1000.0, 'ma200': 900.0,
         'bb_width': 0.20, 'bb_width_min': 0.18, 
         'vol_ratio': 2.5, 'is_bullish': True, 'close_position': 0.8, 
         'market_healthy': True, 'rs_21': 5.0, 'rsi': 65.0
@@ -625,7 +626,7 @@ if __name__ == "__main__":
             exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING UPGRADED LIMIT ORDER BACKTEST (10 POSITIONS)")
+        print(" 🚀 STARTING MOMENTUM BREAKOUT BACKTEST (10 POSITIONS, 4-DAY STOP)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -635,7 +636,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 SMALL CAP SIMULATION RESULTS (DAILY CANCEL & LIMIT)")
+        print(f" 📊 SMALL CAP SIMULATION RESULTS (MOMENTUM & FAST ROTATION)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -645,20 +646,20 @@ if __name__ == "__main__":
         print(f" ▶ 総取引回数 (Trades)     : {res['Total_Trades']} 回")
         
         st = res['Stats']
-        # 指値の約定率を計算するための安全なゼロ除算回避
+        # 逆指値の約定率を計算するための安全なゼロ除算回避
         total_limit_orders = st['orders_exec'] + st['limit_not_filled']
         exec_rate = (st['orders_exec'] / total_limit_orders) * 100 if total_limit_orders > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 指値発注・約定ステータスレポート")
-        print(f" [1] 指値の発注と約定: {st['orders_exec']}約定 / {total_limit_orders}発注 (約定率 {exec_rate:.1f}%)")
-        print(f" [2] 刺さらずキャンセル: {st['limit_not_filled']} 回")
+        print(f" 🔬 逆指値・順張りステータスレポート")
+        print(f" [1] 前日高値ブレイク約定: {st['orders_exec']}約定 / {total_limit_orders}発注 (約定率 {exec_rate:.1f}%)")
+        print(f" [2] ブレイクせずキャンセル(ダマシ回避): {st['limit_not_filled']} 回")
         print(f" [3] 防御モード(半量)発動: {st['half_size_entries']} 回")
         print(f" [4] クライマックス利確(+25%): {st['take_profit']} 回")
         print(f" [5] トレイリングストップ(2.5 ATR): {st['trailing_stops']} 回")
         print(f" [6] 建値ストップ: {st['breakeven_stops']} 回")
         print(f" [7] ハードストップ: {st['hard_stops']} 回")
-        print(f" [8] タイムストップ撤退(8日): {st['time_stops']} 回")
+        print(f" [8] タイムストップ撤退(4日): {st['time_stops']} 回")
         print(f"==================================================", flush=True)
         
         # 整合性証明アサート: 処理された指値注文の数が、発注数と一致するか
