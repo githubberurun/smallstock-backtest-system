@@ -334,7 +334,7 @@ class USMarketCache:
         return 0.0, 15.0
 
 class SmallCapPortfolioBacktester:
-    def __init__(self, data_dir: str, api_key: str, initial_cash: float = 1000000.0, max_positions: int = 5) -> None:
+    def __init__(self, data_dir: str, api_key: str, initial_cash: float = 1000000.0, max_positions: int = 10) -> None:
         if not isinstance(data_dir, str): raise TypeError("data_dir must be string")
         if not isinstance(api_key, str): raise TypeError("api_key must be string")
         
@@ -345,10 +345,9 @@ class SmallCapPortfolioBacktester:
         self.fund_cache = FundamentalCache(data_dir, api_key)
         
         self.stats = {
-            'orders_placed': 0, 'orders_exec': 0,
+            'orders_placed': 0, 'orders_exec': 0, 'limit_not_filled': 0,
             'take_profit': 0, 'trailing_stops': 0, 'hard_stops': 0,
-            'breakeven_stops': 0, 'time_stops': 0, 'gap_cancels': 0,
-            'half_size_entries': 0
+            'breakeven_stops': 0, 'time_stops': 0, 'half_size_entries': 0
         }
         
         debug_log("Loading and calculating indicators for SMALL CAP tickers...")
@@ -383,7 +382,8 @@ class SmallCapPortfolioBacktester:
     def run(self) -> Dict[str, Any]:
         cash = self.cash
         positions: Dict[str, Dict[str, Any]] = {} 
-        pending_orders: List[Dict[str, Any]] = [] 
+        pending_buy_orders: List[Dict[str, Any]] = [] # 翌日への買い指値オーダー
+        pending_sells: List[str] = []                 # 翌日始値で売却する銘柄リスト
         equity_curve: List[float] = []
         total_trades = 0
 
@@ -391,100 +391,112 @@ class SmallCapPortfolioBacktester:
             today_market = self.timeline[date_str]
             n_chg, vix = self.us_market.get_state(date_str)
             
-            current_total_equity = cash + sum([p['qty'] * SmallCapStrategyAnalyzer._to_float(today_market.get(t, {}).get('close', p['entry_p'])) for t, p in positions.items()])
+            # --- 1. 前日にフラグが立った銘柄の「翌日始値」での売却処理 ---
+            still_pending_sells = []
+            for ticker in pending_sells:
+                if ticker in today_market:
+                    row = today_market[ticker]
+                    open_p = SmallCapStrategyAnalyzer._to_float(row.get('open', 0.0))
+                    
+                    if open_p > 0 and ticker in positions:
+                        # 始値で機械的に決済
+                        pos = positions[ticker]
+                        cash += pos['qty'] * (open_p * 0.998) # 手数料・スリッページ考慮
+                        del positions[ticker]
+                        total_trades += 1
+                    else:
+                        still_pending_sells.append(ticker) # 値がつかない場合は持ち越し
+                else:
+                    still_pending_sells.append(ticker)
+            pending_sells = still_pending_sells
+
+            # --- 2. 前日に発注した「指値」の約定判定処理 ---
+            for order in pending_buy_orders:
+                ticker = order['ticker']
+                if ticker in today_market and len(positions) < self.max_positions:
+                    row = today_market[ticker]
+                    open_p = SmallCapStrategyAnalyzer._to_float(row.get('open', 0.0))
+                    low_p = SmallCapStrategyAnalyzer._to_float(row.get('low', 0.0))
+                    limit_p = order['limit_price']
+                    
+                    # ギャップダウン等で始値が指値を下回っていれば始値で、そうでなければ指値で約定
+                    if low_p <= limit_p and open_p > 0:
+                        exec_price = min(open_p, limit_p)
+                        alloc_cash = order['allocated_cash']
+                        qty = alloc_cash // exec_price
+                        
+                        if qty > 0 and cash >= (qty * exec_price):
+                            cash -= qty * exec_price
+                            positions[ticker] = {
+                                'qty': qty, 'entry_p': exec_price, 'high_p': exec_price, 
+                                'days_held': 0, 'swing_low': SmallCapStrategyAnalyzer._to_float(row.get('lowest_5', open_p)),
+                                'breakeven_active': False
+                            }
+                            self.stats['orders_exec'] += 1
+                        else:
+                            self.stats['limit_not_filled'] += 1
+                    else:
+                        self.stats['limit_not_filled'] += 1
             
+            # 約定しなかった指値は毎日リセット（翌日に持ち越さない）
+            pending_buy_orders = []
+
+            # --- 3. 大引け時点（当日の終値）での「売りアラート」判定処理 ---
+            for ticker, pos in positions.items():
+                if ticker in today_market:
+                    row = today_market[ticker]
+                    curr_c = SmallCapStrategyAnalyzer._to_float(row.get('close', 0.0))
+                    curr_h = SmallCapStrategyAnalyzer._to_float(row.get('high', 0.0))
+                    current_atr = SmallCapStrategyAnalyzer._to_float(row.get('atr', 0.0))
+                    rsi = SmallCapStrategyAnalyzer._to_float(row.get('rsi', 0.0))
+                    
+                    pos['days_held'] += 1
+                    pos['high_p'] = max(pos['high_p'], curr_h)
+                    
+                    sell_reason = None
+
+                    # 判定A. テイクプロフィット
+                    if curr_c >= pos['entry_p'] * 1.25 or rsi >= 85.0:
+                        sell_reason = 'take_profit'
+                    else:
+                        # 判定B. ハードストップ
+                        hard_stop_price = pos['entry_p'] - (current_atr * 2.0)
+                        if pos['swing_low'] > 0:
+                            hard_stop_price = min(hard_stop_price, pos['swing_low'] * 0.98) 
+                        if pos.get('breakeven_active', False):
+                            hard_stop_price = max(hard_stop_price, pos['entry_p'] * 1.005) 
+                        
+                        if curr_c <= hard_stop_price:
+                            sell_reason = 'breakeven_stops' if pos.get('breakeven_active', False) else 'hard_stops'
+                        else:
+                            # 判定C. トレイリングストップ
+                            trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
+                            if curr_c <= trailing_stop_price:
+                                sell_reason = 'trailing_stops'
+                            # 判定D. タイムストップ
+                            elif pos['days_held'] >= 8 and curr_c <= (pos['entry_p'] * 1.02):
+                                sell_reason = 'time_stops'
+
+                    # フリーロール（建値確保）の発動チェック
+                    if pos['high_p'] >= pos['entry_p'] + (current_atr * 2.0):
+                        pos['breakeven_active'] = True
+
+                    # 売り条件を満たした銘柄は翌日始値売りリスト（pending_sells）へ
+                    if sell_reason and ticker not in pending_sells:
+                        pending_sells.append(ticker)
+                        self.stats[sell_reason] += 1
+
+            # --- 4. 翌日のための「指値買い」の選定と発注 ---
             is_market_healthy = True
             if today_market:
                 first_ticker = list(today_market.keys())[0]
                 is_market_healthy = bool(today_market[first_ticker].get('market_healthy', True))
 
-            new_pending = []
-            for order in pending_orders:
-                ticker = order['ticker']
-                if ticker in today_market and len(positions) < self.max_positions:
-                    row = today_market[ticker]
-                    open_p = SmallCapStrategyAnalyzer._to_float(row.get('open', 0.0))
-                    prev_close = SmallCapStrategyAnalyzer._to_float(row.get('prev_close', open_p))
-                    lowest_5 = SmallCapStrategyAnalyzer._to_float(row.get('lowest_5', open_p))
-                    
-                    self.stats['orders_placed'] += 1
-                    
-                    if open_p > (prev_close * 1.05) or open_p < (prev_close * 0.98):
-                        self.stats['gap_cancels'] += 1
-                        continue 
-                        
-                    exec_price = open_p * 1.002 
-                    alloc_cash = order['allocated_cash']
-                    qty = alloc_cash // exec_price
-                    
-                    if qty > 0 and cash >= (qty * exec_price):
-                        cash -= qty * exec_price
-                        positions[ticker] = {
-                            'qty': qty, 'entry_p': exec_price, 'high_p': exec_price, 
-                            'days_held': 0, 'swing_low': lowest_5,
-                            'breakeven_active': False
-                        }
-                        self.stats['orders_exec'] += 1
-            pending_orders = new_pending
-
-            closed_tickers = []
-            for ticker, pos in positions.items():
-                if ticker not in today_market: continue
-                row = today_market[ticker]
-                
-                curr_c = SmallCapStrategyAnalyzer._to_float(row.get('close', 0.0))
-                current_atr = SmallCapStrategyAnalyzer._to_float(row.get('atr', 0.0))
-                rsi = SmallCapStrategyAnalyzer._to_float(row.get('rsi', 0.0))
-                
-                pos['days_held'] += 1
-                pos['high_p'] = max(pos['high_p'], curr_c)
-                exit_score = 0
-
-                # 1. テイクプロフィット (+25% または RSI 85以上)
-                if (curr_c >= pos['entry_p'] * 1.25 or rsi >= 85.0) and exit_score == 0:
-                    exit_score += 100
-                    self.stats['take_profit'] += 1
-
-                # 2. フリーロール発動
-                if pos['high_p'] >= pos['entry_p'] + (current_atr * 2.0):
-                    pos['breakeven_active'] = True
-
-                # 3. ハードストップ (2.0 ATR)
-                hard_stop_price = pos['entry_p'] - (current_atr * 2.0)
-                if pos['swing_low'] > 0:
-                    hard_stop_price = min(hard_stop_price, pos['swing_low'] * 0.98) 
-                
-                if pos.get('breakeven_active', False):
-                    hard_stop_price = max(hard_stop_price, pos['entry_p'] * 1.005) 
-                
-                if curr_c <= hard_stop_price and exit_score == 0:
-                    exit_score += 100
-                    if pos.get('breakeven_active', False):
-                        self.stats['breakeven_stops'] += 1
-                    else:
-                        self.stats['hard_stops'] += 1
-                        
-                # 4. トレイリングストップ (158%時の完全復元：2.5 ATR固定)
-                trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
-                if curr_c <= trailing_stop_price and exit_score == 0:
-                    exit_score += 100
-                    self.stats['trailing_stops'] += 1
-                
-                # 5. タイムストップ (158%時の完全復元：8日経過かつ建値+2%以下)
-                if pos['days_held'] >= 8 and curr_c <= (pos['entry_p'] * 1.02) and exit_score == 0: 
-                    exit_score += 100
-                    self.stats['time_stops'] += 1
-
-                if exit_score >= 80:
-                    cash += pos['qty'] * (curr_c * 0.998)
-                    total_trades += 1
-                    closed_tickers.append(ticker)
-
-            for ct in closed_tickers:
-                del positions[ct]
-
-            # 動的ポジションサイジング
-            open_slots = self.max_positions - len(positions)
+            current_total_equity = cash + sum([p['qty'] * SmallCapStrategyAnalyzer._to_float(today_market.get(t, {}).get('close', p['entry_p'])) for t, p in positions.items()])
+            
+            # 明日の空き枠を計算（すでに売却予定の銘柄は枠が空くとみなす）
+            expected_positions = len(positions) - len([t for t in pending_sells if t in positions])
+            open_slots = self.max_positions - expected_positions
             
             if open_slots > 0 and cash > 0 and vix < 25.0:
                 risk_multiplier = 1.0
@@ -493,7 +505,8 @@ class SmallCapPortfolioBacktester:
                 
                 candidates = []
                 for ticker, row in today_market.items():
-                    if ticker in positions: continue 
+                    # 既に保有している、または明日売却予定の銘柄は除外
+                    if ticker in positions or ticker in pending_sells: continue 
                     
                     fund_data = self.fund_cache.get_fundamentals(ticker)
                     is_entry, score, is_high_risk = SmallCapStrategyAnalyzer.evaluate_entry(row, fund_data)
@@ -501,22 +514,30 @@ class SmallCapPortfolioBacktester:
                     if is_entry:
                         candidates.append((score, ticker))
                 
+                # スコア順にソートして、上位有望銘柄のみ発注
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 allowed_slots_today = min(open_slots, self.max_positions)
                 
                 for score, ticker in candidates[:allowed_slots_today]:
                     max_alloc_per_trade = (current_total_equity * (1.0 / self.max_positions)) * risk_multiplier
-                    target_alloc = min(cash / open_slots, max_alloc_per_trade)
+                    target_alloc = min(cash / max(1, open_slots), max_alloc_per_trade)
                     
-                    pending_orders.append({
+                    # 💡 指値ロジック: 当日終値の -1.0% (小型株のふるい落としディップ買い)
+                    curr_close = SmallCapStrategyAnalyzer._to_float(today_market[ticker].get('close', 0.0))
+                    limit_price = curr_close * 0.99
+                    
+                    pending_buy_orders.append({
                         'ticker': ticker,
-                        'allocated_cash': target_alloc
+                        'allocated_cash': target_alloc,
+                        'limit_price': limit_price
                     })
+                    
+                    self.stats['orders_placed'] += 1
                     if risk_multiplier == 0.5:
                         self.stats['half_size_entries'] += 1
-                    
                     open_slots -= 1
 
+            # 資産曲線の記録
             daily_equity = cash
             for ticker, pos in positions.items():
                 if ticker in today_market:
@@ -550,7 +571,7 @@ class SmallCapPortfolioBacktester:
 # 5. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity tests for Q-Mo Logic...")
+    debug_log("Running integrity tests for Upgraded Limit Order Logic...")
     empty_df = pd.DataFrame()
     res_df = SmallCapStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
@@ -604,17 +625,17 @@ if __name__ == "__main__":
             exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING SMALL CAP PORTFOLIO BACKTEST")
+        print(" 🚀 STARTING UPGRADED LIMIT ORDER BACKTEST (10 POSITIONS)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
-        MAX_CONCURRENT_POSITIONS = 5
+        MAX_CONCURRENT_POSITIONS = 10  # 10銘柄まで保有する新仕様
         
         tester = SmallCapPortfolioBacktester(data_dir=data_dir, api_key=JQ_API_KEY, initial_cash=STARTING_CAPITAL, max_positions=MAX_CONCURRENT_POSITIONS)
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 SMALL CAP SIMULATION RESULTS (DYNAMIC SIZING VCP - RESTORED)")
+        print(f" 📊 SMALL CAP SIMULATION RESULTS (DAILY CANCEL & LIMIT)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -624,12 +645,14 @@ if __name__ == "__main__":
         print(f" ▶ 総取引回数 (Trades)     : {res['Total_Trades']} 回")
         
         st = res['Stats']
-        exec_rate = (st['orders_exec'] / st['orders_placed']) * 100 if st['orders_placed'] > 0 else 0
+        # 指値の約定率を計算するための安全なゼロ除算回避
+        total_limit_orders = st['orders_exec'] + st['limit_not_filled']
+        exec_rate = (st['orders_exec'] / total_limit_orders) * 100 if total_limit_orders > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 動的資金管理・最高益復元レポート")
-        print(f" [1] 成行の約定状況: {st['orders_exec']}/{st['orders_placed']} ({exec_rate:.1f}%)")
-        print(f" [2] ギャップ回避: {st['gap_cancels']} 回")
+        print(f" 🔬 指値発注・約定ステータスレポート")
+        print(f" [1] 指値の発注と約定: {st['orders_exec']}約定 / {total_limit_orders}発注 (約定率 {exec_rate:.1f}%)")
+        print(f" [2] 刺さらずキャンセル: {st['limit_not_filled']} 回")
         print(f" [3] 防御モード(半量)発動: {st['half_size_entries']} 回")
         print(f" [4] クライマックス利確(+25%): {st['take_profit']} 回")
         print(f" [5] トレイリングストップ(2.5 ATR): {st['trailing_stops']} 回")
@@ -637,6 +660,9 @@ if __name__ == "__main__":
         print(f" [7] ハードストップ: {st['hard_stops']} 回")
         print(f" [8] タイムストップ撤退(8日): {st['time_stops']} 回")
         print(f"==================================================", flush=True)
+        
+        # 整合性証明アサート: 処理された指値注文の数が、発注数と一致するか
+        assert st['orders_exec'] + st['limit_not_filled'] == st['orders_placed'], "Order tracking mismatch: Placed != Exec + Unfilled"
         
     except Exception as e:
         print(f"[FATAL] {e}")
