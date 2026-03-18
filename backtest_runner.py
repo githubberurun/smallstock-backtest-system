@@ -305,7 +305,7 @@ class SmallCapStrategyAnalyzer:
         
         if curr_c > ma50_val and ma50_val > ma200_val:
             if bb_width <= 0.25:
-                # 💡 147%を叩き出した最強のコアフィルターへ完全復元 (10日高値フィルター撤廃)
+                # 💡 147%最適解フィルター (RSI 60~80, 日次リターン+3%以上, ボリバン収縮)
                 if vol_ratio >= 2.0 and is_bullish and close_pos >= 0.70 and rs_21 > 0.0 and (60.0 <= rsi < 80.0) and price_change >= 0.03:
                     score = float(vol_ratio * rs_21)
                 
@@ -354,7 +354,7 @@ class SmallCapPortfolioBacktester:
         
         self.stats = {
             'orders_placed': 0, 'orders_exec': 0, 'gap_cancels': 0,
-            'climax_sell': 0, 'trailing_stops': 0, 'hard_stops': 0,
+            'take_profit': 0, 'trailing_stops': 0, 'hard_stops': 0,
             'breakeven_stops': 0, 'time_stops': 0, 'half_size_entries': 0
         }
         
@@ -459,9 +459,9 @@ class SmallCapPortfolioBacktester:
                     
                     sell_reason = None
 
-                    # 💡 青天井ロジック: 固定の25%利確を撤廃。RSIが85を超えた異常過熱時のみクライマックス売りとする
-                    if rsi >= 85.0:
-                        sell_reason = 'climax_sell'
+                    # 💡 147%最適解ロジック: +25%の固定利確(防衛メカニズム)を完全復元
+                    if curr_c >= pos['entry_p'] * 1.25 or rsi >= 85.0:
+                        sell_reason = 'take_profit'
                     else:
                         # 判定B. ハードストップ
                         hard_stop_price = pos['entry_p'] - (current_atr * 2.0)
@@ -473,11 +473,11 @@ class SmallCapPortfolioBacktester:
                         if curr_c <= hard_stop_price:
                             sell_reason = 'breakeven_stops' if pos.get('breakeven_active', False) else 'hard_stops'
                         else:
-                            # 判定C. トレイリングストップ (利益が乗った銘柄はこれで最後まで引っ張る)
+                            # 判定C. トレイリングストップ
                             trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
                             if curr_c <= trailing_stop_price:
                                 sell_reason = 'trailing_stops'
-                            # 判定D. タイムストップ (8日間で回帰。3日早期撤退は廃止)
+                            # 判定D. タイムストップ (8日間)
                             elif pos['days_held'] >= 8 and curr_c <= (pos['entry_p'] * 1.02):
                                 sell_reason = 'time_stops'
 
@@ -565,7 +565,7 @@ class SmallCapPortfolioBacktester:
 # 5. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity tests for Uncapped Trailing Logic...")
+    debug_log("Running integrity tests for Core Reversion Logic...")
     empty_df = pd.DataFrame()
     res_df = SmallCapStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
@@ -584,6 +584,14 @@ def run_integrity_tests() -> None:
         assert is_entry is True, "Valid Scaled VCP Breakout row should return True"
     except Exception as e:
         raise AssertionError(f"Failed handling valid data: {e}")
+
+    dummy_row_weak = dummy_row_ok.copy()
+    dummy_row_weak['close'] = 1010.0 # +1.0% jump (fails the >3% filter)
+    try:
+        is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_weak, dummy_fund_ok)
+        assert is_entry is False, "Weak breakout (<3%) must be rejected"
+    except Exception as e:
+        raise AssertionError(f"Failed handling weak breakout data: {e}")
 
     dummy_row_err = {'ma200': np.nan, 'vol_ratio': 'invalid', 'market_healthy': 'error'}
     dummy_fund_err = {'roe': None, 'equity_ratio': 'error'}
@@ -613,17 +621,17 @@ if __name__ == "__main__":
             exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING UNCAPPED TRAILING BACKTEST (LET WINNERS RUN)")
+        print(" 🚀 STARTING REVERT TO MASTER BACKTEST (5 POSITIONS, 8-DAY STOP, 25% TP)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
-        MAX_CONCURRENT_POSITIONS = 5
+        MAX_CONCURRENT_POSITIONS = 5  
         
         tester = SmallCapPortfolioBacktester(data_dir=data_dir, api_key=JQ_API_KEY, initial_cash=STARTING_CAPITAL, max_positions=MAX_CONCURRENT_POSITIONS)
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 SMALL CAP SIMULATION RESULTS (LET WINNERS RUN)")
+        print(f" 📊 SMALL CAP SIMULATION RESULTS (MASTER ENGINE)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -636,11 +644,11 @@ if __name__ == "__main__":
         exec_rate = (st['orders_exec'] / st['orders_placed']) * 100 if st['orders_placed'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 青天井トレイリング・ステータスレポート")
+        print(f" 🔬 マスターモデル・ステータスレポート")
         print(f" [1] 翌日始値(成行)での約定: {st['orders_exec']}約定 / {st['orders_placed']}発注 (約定率 {exec_rate:.1f}%)")
         print(f" [2] 極端なギャップ回避(注文取消): {st['gap_cancels']} 回")
         print(f" [3] 防御モード(半量)発動: {st['half_size_entries']} 回")
-        print(f" [4] クライマックス利確(RSI85超): {st['climax_sell']} 回")
+        print(f" [4] クライマックス利確(+25%): {st['take_profit']} 回")
         print(f" [5] トレイリングストップ(2.5 ATR): {st['trailing_stops']} 回")
         print(f" [6] 建値ストップ: {st['breakeven_stops']} 回")
         print(f" [7] ハードストップ: {st['hard_stops']} 回")
