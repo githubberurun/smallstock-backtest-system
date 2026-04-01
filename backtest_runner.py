@@ -285,7 +285,8 @@ class SmallCapStrategyAnalyzer:
         roe = SmallCapStrategyAnalyzer._to_float(fund_data.get('roe', 0.0))
         eq_ratio = SmallCapStrategyAnalyzer._to_float(fund_data.get('equity_ratio', 0.0))
         
-        if roe < 10.0 or eq_ratio < 50.0:
+        # 💡 財務フィルターの緩和: ROE制限撤廃、自己資本比率を25%へ（赤字グロースを許容）
+        if eq_ratio < 25.0:
             return False, 0.0, False 
             
         prev_c = SmallCapStrategyAnalyzer._to_float(row_dict.get('prev_close', curr_c))
@@ -576,12 +577,12 @@ def run_integrity_tests() -> None:
         'vol_ratio': 2.5, 'is_bullish': True, 'close_position': 0.8, 
         'market_healthy': True, 'rs_21': 5.0, 'rsi': 65.0
     }
-    dummy_fund_ok = {'roe': 12.0, 'equity_ratio': 55.0}
+    dummy_fund_ok = {'roe': -5.0, 'equity_ratio': 55.0} # ROEマイナスでも通るかテスト
     try:
         is_entry, score, is_risk = SmallCapStrategyAnalyzer.evaluate_entry(dummy_row_ok, dummy_fund_ok)
         assert isinstance(score, float)
         assert score == 12.5, f"Score math error: expected 12.5 (2.5 * 5.0), got {score}"
-        assert is_entry is True, "Valid Scaled VCP Breakout row should return True"
+        assert is_entry is True, "Valid Scaled VCP Breakout row should return True even with negative ROE"
     except Exception as e:
         raise AssertionError(f"Failed handling valid data: {e}")
 
